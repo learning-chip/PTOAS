@@ -59,9 +59,10 @@ jobs:
             WORKSPACE_DIR=/llvm-workspace
             LLVM_SOURCE_DIR=$WORKSPACE_DIR/llvm-project
             LLVM_BUILD_DIR=$LLVM_SOURCE_DIR/build-shared
-            # Derive a manylinux Python version from the first CIBW_BUILD tag
-            # Example: cp39-manylinux_x86_64 -> cp39-cp39
-            PY_TAG=$(echo "$CIBW_BUILD" | awk '{print $1}' | cut -d- -f1)
+            # Derive a manylinux Python version from matrix.python
+            # Example: 3.10 -> cp310-cp310
+            PY_TAG="cp${{ matrix.python }}"
+            PY_TAG="${PY_TAG//./}"
             PY_VER="${PY_TAG}-${PY_TAG}"
             PY_PATH="/opt/python/${PY_VER}"
             PYTHON_BIN="${PY_PATH}/bin/python"
