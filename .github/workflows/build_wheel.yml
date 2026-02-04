@@ -16,6 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        python: ["3.10", "3.11"]
         include:
           - os: ubuntu-24.04
             arch: x86_64
@@ -29,7 +30,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python }}
 
       - name: Install cibuildwheel
         run: pip install cibuildwheel==3.3.1
@@ -42,7 +43,7 @@ jobs:
 
       - name: Build wheels with cibuildwheel
         env:
-          CIBW_BUILD: "cp39-manylinux_${{ matrix.arch }} cp310-manylinux_${{ matrix.arch }} cp311-manylinux_${{ matrix.arch }}"
+          CIBW_BUILD: "cp310-manylinux_${{ matrix.arch }} cp311-manylinux_${{ matrix.arch }}"
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_34
           CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_34
 
@@ -58,6 +59,16 @@ jobs:
             WORKSPACE_DIR=/llvm-workspace
             LLVM_SOURCE_DIR=$WORKSPACE_DIR/llvm-project
             LLVM_BUILD_DIR=$LLVM_SOURCE_DIR/build-shared
+            # Derive a manylinux Python version from the first CIBW_BUILD tag
+            # Example: cp39-manylinux_x86_64 -> cp39-cp39
+            PY_TAG=$(echo "$CIBW_BUILD" | awk '{print $1}' | cut -d- -f1)
+            PY_VER="${PY_TAG}-${PY_TAG}"
+            PY_PATH="/opt/python/${PY_VER}"
+            PYTHON_BIN="${PY_PATH}/bin/python"
+            PYTHON_ROOT="${PY_PATH}"
+
+            # Ensure Python deps are available for LLVM/PTOAS config
+            ${PYTHON_BIN} -m pip install --no-cache-dir numpy pybind11 nanobind setuptools wheel auditwheel
 
             # Check cache
             if [ -d "/host/tmp/llvm-cache/build-shared" ] && [ -f "/host/tmp/llvm-cache/build-shared/lib/cmake/mlir/MLIRConfig.cmake" ]; then
@@ -75,7 +86,8 @@ jobs:
                 -DLLVM_ENABLE_PROJECTS="mlir;clang" \
                 -DBUILD_SHARED_LIBS=ON \
                 -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
-                -DPython3_EXECUTABLE=$(which python3) \
+                -DPython3_ROOT_DIR=${PYTHON_ROOT} \
+                -DPython3_EXECUTABLE=${PYTHON_BIN} \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DLLVM_TARGETS_TO_BUILD="host"
               ninja -C $LLVM_BUILD_DIR
