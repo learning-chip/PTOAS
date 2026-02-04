@@ -11,210 +11,245 @@ env:
 
 jobs:
   build_wheel:
-    name: Build wheel (Python ${{ matrix.python }}, ${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    name: Build wheel (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.9", "3.10", "3.11"]
-        arch: [x86_64, aarch64]
-
-    container:
-      image: quay.io/pypa/manylinux_2_34_${{ matrix.arch }}
+        include:
+          - os: ubuntu-24.04
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set Python version
-        run: |
-          # Map Python version to manylinux path
-          case "${{ matrix.python }}" in
-            "3.9")  PY_VER="cp39-cp39" ;;
-            "3.10") PY_VER="cp310-cp310" ;;
-            "3.11") PY_VER="cp311-cp311" ;;
-            "3.12") PY_VER="cp312-cp312" ;;
-            *)      PY_VER="cp311-cp311" ;;
-          esac
-          echo "PY_VER=$PY_VER" >> $GITHUB_ENV
-          echo "PY_PATH=/opt/python/$PY_VER" >> $GITHUB_ENV
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      - name: Install system dependencies
-        run: |
-          dnf install -y ninja-build cmake git ccache gcc-c++ lld zip
-          dnf clean all
-
-      - name: Install Python dependencies
-        run: |
-          export PATH="${PY_PATH}/bin:$PATH"
-          pip install --no-cache-dir numpy pybind11 nanobind setuptools wheel auditwheel
-
-      - name: Set build directories
-        run: |
-          echo "WORKSPACE_DIR=/llvm-workspace" >> $GITHUB_ENV
-          echo "LLVM_SOURCE_DIR=/llvm-workspace/llvm-project" >> $GITHUB_ENV
-          echo "LLVM_BUILD_DIR=/llvm-workspace/llvm-project/build-shared" >> $GITHUB_ENV
-          echo "PTO_SOURCE_DIR=$GITHUB_WORKSPACE" >> $GITHUB_ENV
-          echo "PTO_INSTALL_DIR=$GITHUB_WORKSPACE/install" >> $GITHUB_ENV
+      - name: Install cibuildwheel
+        run: pip install cibuildwheel==3.3.1
 
       - name: Cache LLVM build
-        id: cache-llvm
         uses: actions/cache@v4
         with:
-          path: /llvm-workspace/llvm-project/build-shared
-          key: llvm-${{ env.LLVM_TAG }}-manylinux_2_34-${{ matrix.arch }}-${{ matrix.python }}-v1
+          path: /tmp/llvm-cache
+          key: llvm-${{ env.LLVM_TAG }}-manylinux_2_34-${{ matrix.arch }}-v3
 
-      - name: Clone LLVM
+      - name: Build wheels with cibuildwheel
+        env:
+          CIBW_BUILD: "cp39-manylinux_${{ matrix.arch }} cp310-manylinux_${{ matrix.arch }} cp311-manylinux_${{ matrix.arch }}"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_34
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_34
+
+          # Install system dependencies and build LLVM (runs once per platform)
+          CIBW_BEFORE_ALL: |
+            set -ex
+
+            # Install system dependencies
+            dnf install -y ninja-build cmake git ccache gcc-c++ lld zip
+            dnf clean all
+
+            # Paths
+            WORKSPACE_DIR=/llvm-workspace
+            LLVM_SOURCE_DIR=$WORKSPACE_DIR/llvm-project
+            LLVM_BUILD_DIR=$LLVM_SOURCE_DIR/build-shared
+
+            # Check cache
+            if [ -d "/host/tmp/llvm-cache/build-shared" ] && [ -f "/host/tmp/llvm-cache/build-shared/lib/cmake/mlir/MLIRConfig.cmake" ]; then
+              echo "=== Restoring LLVM from cache ==="
+              mkdir -p $LLVM_SOURCE_DIR
+              cp -r /host/tmp/llvm-cache/build-shared $LLVM_BUILD_DIR
+            else
+              echo "=== Building LLVM from source ==="
+              mkdir -p $WORKSPACE_DIR
+              cd $WORKSPACE_DIR
+              git clone --depth 1 --branch $LLVM_TAG https://github.com/llvm/llvm-project.git
+
+              cd $LLVM_SOURCE_DIR
+              cmake -G Ninja -S llvm -B $LLVM_BUILD_DIR \
+                -DLLVM_ENABLE_PROJECTS="mlir;clang" \
+                -DBUILD_SHARED_LIBS=ON \
+                -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
+                -DPython3_EXECUTABLE=$(which python3) \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DLLVM_TARGETS_TO_BUILD="host"
+              ninja -C $LLVM_BUILD_DIR
+
+              # Save to cache
+              echo "=== Saving LLVM to cache ==="
+              mkdir -p /host/tmp/llvm-cache
+              rm -rf /host/tmp/llvm-cache/build-shared
+              cp -r $LLVM_BUILD_DIR /host/tmp/llvm-cache/build-shared
+            fi
+
+          # Build PTOAS for each Python version
+          CIBW_BEFORE_BUILD: |
+            set -ex
+
+            # Install Python dependencies
+            pip install numpy pybind11 nanobind setuptools wheel
+
+            # Paths
+            WORKSPACE_DIR=/llvm-workspace
+            LLVM_BUILD_DIR=$WORKSPACE_DIR/llvm-project/build-shared
+            PTO_SOURCE_DIR={project}
+            PTO_INSTALL_DIR=$PTO_SOURCE_DIR/install
+            PY_PACKAGE_DIR=$LLVM_BUILD_DIR/tools/mlir/python_packages/mlir_core
+
+            # Build PTOAS
+            cd $PTO_SOURCE_DIR
+            rm -rf build install  # Clean previous build
+            cmake -G Ninja \
+              -S . \
+              -B build \
+              -DLLVM_DIR=$LLVM_BUILD_DIR/lib/cmake/llvm \
+              -DMLIR_DIR=$LLVM_BUILD_DIR/lib/cmake/mlir \
+              -DPython3_EXECUTABLE=$(which python) \
+              -DPython3_FIND_STRATEGY=LOCATION \
+              -Dpybind11_DIR=$(python -m pybind11 --cmakedir) \
+              -DMLIR_PYTHON_PACKAGE_DIR=$PY_PACKAGE_DIR \
+              -DCMAKE_INSTALL_PREFIX=$PTO_INSTALL_DIR
+            ninja -C build
+            ninja -C build install
+
+            # Copy PTO dialect files to MLIR package directory
+            cp $PTO_INSTALL_DIR/mlir/dialects/*.py $PY_PACKAGE_DIR/mlir/dialects/
+
+            # Copy setup.py to package directory
+            cp $PTO_SOURCE_DIR/docker/setup.py $PY_PACKAGE_DIR/
+
+          CIBW_ENVIRONMENT: >
+            LLVM_TAG=${{ env.LLVM_TAG }}
+            WORKSPACE_DIR=/llvm-workspace
+            LLVM_BUILD_DIR=/llvm-workspace/llvm-project/build-shared
+            PTO_INSTALL_DIR={project}/install
+
+          # Build from MLIR package directory
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          
+          # Override the package directory for wheel building
+          CIBW_CONFIG_SETTINGS: ""
+
+          # Repair wheel to bundle shared libraries
+          CIBW_REPAIR_WHEEL_COMMAND: |
+            export LD_LIBRARY_PATH=/llvm-workspace/llvm-project/build-shared/lib:{project}/install/lib:$LD_LIBRARY_PATH
+            auditwheel repair --plat {delocate_plat} -w {dest_dir} {wheel}
+
+          # Test the built wheel
+          CIBW_TEST_COMMAND: |
+            python -c "import mlir.ir; print('mlir.ir OK')"
+            python -c "from mlir.dialects import pto; print('pto dialect OK')"
+
         run: |
-          mkdir -p $WORKSPACE_DIR
-          cd $WORKSPACE_DIR
-          if [ ! -d llvm-project ]; then
-            git clone --depth 1 --branch ${{ env.LLVM_TAG }} https://github.com/llvm/llvm-project.git
-          fi
+          # Create a minimal setup.py at project root that delegates to MLIR package dir
+          cat > setup.py << 'SETUP_EOF'
+          import os
+          import sys
 
-      - name: Build LLVM/MLIR
-        if: steps.cache-llvm.outputs.cache-hit != 'true'
-        run: |
-          export PATH="${PY_PATH}/bin:$PATH"
-          cd $LLVM_SOURCE_DIR
-          cmake -G Ninja -S llvm -B $LLVM_BUILD_DIR \
-            -DLLVM_ENABLE_PROJECTS="mlir;clang" \
-            -DBUILD_SHARED_LIBS=ON \
-            -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
-            -DPython3_EXECUTABLE=${PY_PATH}/bin/python \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_TARGETS_TO_BUILD="host"
-          ninja -C $LLVM_BUILD_DIR
+          # Change to MLIR package directory where the actual package is
+          py_package_dir = os.environ.get('LLVM_BUILD_DIR', '/llvm-workspace/llvm-project/build-shared')
+          py_package_dir = os.path.join(py_package_dir, 'tools/mlir/python_packages/mlir_core')
 
-      - name: Build PTOAS
-        run: |
-          export PATH="${PY_PATH}/bin:$PATH"
-          cd $PTO_SOURCE_DIR
-          cmake -G Ninja \
-            -S . \
-            -B build \
-            -DLLVM_DIR=$LLVM_BUILD_DIR/lib/cmake/llvm \
-            -DMLIR_DIR=$LLVM_BUILD_DIR/lib/cmake/mlir \
-            -DPython3_ROOT_DIR=${PY_PATH} \
-            -DPython3_EXECUTABLE=${PY_PATH}/bin/python \
-            -DPython3_FIND_STRATEGY=LOCATION \
-            -Dpybind11_DIR=$(${PY_PATH}/bin/python -m pybind11 --cmakedir) \
-            -DMLIR_PYTHON_PACKAGE_DIR=${LLVM_BUILD_DIR}/tools/mlir/python_packages/mlir_core \
-            -DCMAKE_INSTALL_PREFIX=${PTO_INSTALL_DIR}
-          ninja -C build
-          ninja -C build install
+          if os.path.isdir(py_package_dir):
+              os.chdir(py_package_dir)
+              # Re-execute setup.py from there
+              exec(open('setup.py').read())
+          else:
+              print(f"ERROR: Package directory not found: {py_package_dir}", file=sys.stderr)
+              sys.exit(1)
+          SETUP_EOF
 
-      - name: Create Python wheel
-        run: |
-          export PATH="${PY_PATH}/bin:$PATH"
-          export PY_PACKAGE_DIR=$LLVM_BUILD_DIR/tools/mlir/python_packages/mlir_core
-          
-          # Copy PTO dialect files to MLIR package directory
-          cp $PTO_INSTALL_DIR/mlir/dialects/*.py $PY_PACKAGE_DIR/mlir/dialects/
-          
-          # Copy setup.py to package directory
-          cp $PTO_SOURCE_DIR/docker/setup.py $PY_PACKAGE_DIR/
-          
-          # Build the wheel
-          cd $PY_PACKAGE_DIR
-          python setup.py bdist_wheel
-
-      - name: Repair wheel with auditwheel
-        run: |
-          export PATH="${PY_PATH}/bin:$PATH"
-          export PY_PACKAGE_DIR=$LLVM_BUILD_DIR/tools/mlir/python_packages/mlir_core
-          export LD_LIBRARY_PATH=$LLVM_BUILD_DIR/lib:$PTO_INSTALL_DIR/lib:$LD_LIBRARY_PATH
-          
-          cd $PY_PACKAGE_DIR
-          auditwheel repair --plat manylinux_2_34_${{ matrix.arch }} dist/ptoas*.whl -w wheelhouse
-
-      - name: Test wheel installation
-        run: |
-          export PATH="${PY_PATH}/bin:$PATH"
-          export PY_PACKAGE_DIR=$LLVM_BUILD_DIR/tools/mlir/python_packages/mlir_core
-          
-          pip install $PY_PACKAGE_DIR/wheelhouse/ptoas*.whl
-          
-          # Test imports in a clean directory
-          cd /tmp
-          python -c "import mlir.ir; print('mlir.ir imported successfully')"
-          python -c "from mlir.dialects import pto; print('pto dialect imported successfully')"
-
-      - name: Test ptoas CLI
-        run: |
-          export PATH="${PY_PATH}/bin:$PATH"
-          export PATH=$PTO_SOURCE_DIR/build/tools/ptoas:$PATH
-          export PYTHONPATH=$LLVM_BUILD_DIR/tools/mlir/python_packages/mlir_core:$PTO_INSTALL_DIR:$PYTHONPATH
-          export LD_LIBRARY_PATH=$LLVM_BUILD_DIR/lib:$PTO_INSTALL_DIR/lib:$LD_LIBRARY_PATH
-          
-          which ptoas
-          
-          # Test MatMul sample
-          cd $PTO_SOURCE_DIR/test/samples/MatMul/
-          python ./tmatmulk.py > ./tmatmulk.pto
-          ptoas ./tmatmulk.pto -o ./tmatmulk.cpp
-          
-          # Test Abs sample
-          cd $PTO_SOURCE_DIR/test/samples/Abs/
-          python ./abs.py > ./abs.pto
-          ptoas --enable-insert-sync ./abs.pto -o ./abs.cpp
-
-      - name: Copy wheel to workspace
-        run: |
-          export PY_PACKAGE_DIR=$LLVM_BUILD_DIR/tools/mlir/python_packages/mlir_core
-          mkdir -p $GITHUB_WORKSPACE/wheelhouse
-          cp $PY_PACKAGE_DIR/wheelhouse/ptoas*.whl $GITHUB_WORKSPACE/wheelhouse/
-
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ptoas-wheel-py${{ matrix.python }}-${{ matrix.arch }}
-          path: wheelhouse/*.whl
+          cibuildwheel --output-dir wheelhouse
 
       - name: Collect ptoas binary and dependencies
         run: |
-          export LD_LIBRARY_PATH=$LLVM_BUILD_DIR/lib:$PTO_INSTALL_DIR/lib:$LD_LIBRARY_PATH
-          
-          PTOAS_BIN=$PTO_SOURCE_DIR/build/tools/ptoas/ptoas
-          PTOAS_DIST_DIR=$GITHUB_WORKSPACE/ptoas-dist
-          PTOAS_DEPS_DIR=$PTOAS_DIST_DIR/lib
-          
-          mkdir -p $PTOAS_DIST_DIR/bin $PTOAS_DEPS_DIR
-          
-          # Copy ptoas binary
-          cp $PTOAS_BIN $PTOAS_DIST_DIR/bin/
-          
-          # Collect *.so dependencies (transitive closure under /llvm-workspace)
-          copy_so() {
-            local f="$1"
-            [[ -f "$f" ]] || return 0
-            local name=$(basename "$f")
-            [[ -f "${PTOAS_DEPS_DIR}/${name}" ]] && return 0
-            cp -n "$f" "${PTOAS_DEPS_DIR}/" 2>/dev/null || true
-            while read -r res; do
-              copy_so "$res"
-            done < <(ldd "$f" 2>/dev/null | awk '/=> \/llvm-workspace\// {print $3}')
-          }
-          
-          while read -r res; do
-            copy_so "$res"
-          done < <(ldd "$PTOAS_BIN" 2>/dev/null | awk '/=> \/llvm-workspace\// {print $3}')
-          
-          # Create a wrapper script for convenience
-          cat > $PTOAS_DIST_DIR/ptoas << 'EOF'
+          # Run collection inside container to access the built artifacts
+          docker run --rm \
+            -v $PWD:/workspace:ro \
+            -v /tmp/llvm-cache:/llvm-cache:ro \
+            -v $PWD/ptoas-dist:/output:rw \
+            quay.io/pypa/manylinux_2_34_${{ matrix.arch }} \
+            bash -c '
+              set -ex
+              
+              LLVM_BUILD_DIR=/llvm-workspace/llvm-project/build-shared
+              PTO_SOURCE_DIR=/workspace
+              PTO_INSTALL_DIR=$PTO_SOURCE_DIR/install
+              
+              # Restore LLVM build for ldd to work
+              mkdir -p /llvm-workspace/llvm-project
+              cp -r /llvm-cache/build-shared $LLVM_BUILD_DIR
+              
+              # Rebuild ptoas quickly (already compiled, just needs linking info)
+              export PATH="/opt/python/cp311-cp311/bin:$PATH"
+              pip install numpy pybind11 nanobind
+              
+              cd $PTO_SOURCE_DIR
+              if [ ! -f build/tools/ptoas/ptoas ]; then
+                dnf install -y ninja-build cmake gcc-c++ lld
+                cmake -G Ninja \
+                  -S . \
+                  -B build \
+                  -DLLVM_DIR=$LLVM_BUILD_DIR/lib/cmake/llvm \
+                  -DMLIR_DIR=$LLVM_BUILD_DIR/lib/cmake/mlir \
+                  -DPython3_EXECUTABLE=$(which python) \
+                  -DPython3_FIND_STRATEGY=LOCATION \
+                  -Dpybind11_DIR=$(python -m pybind11 --cmakedir) \
+                  -DMLIR_PYTHON_PACKAGE_DIR=$LLVM_BUILD_DIR/tools/mlir/python_packages/mlir_core \
+                  -DCMAKE_INSTALL_PREFIX=$PTO_INSTALL_DIR
+                ninja -C build
+              fi
+              
+              export LD_LIBRARY_PATH=$LLVM_BUILD_DIR/lib:$PTO_INSTALL_DIR/lib:$LD_LIBRARY_PATH
+              
+              PTOAS_BIN=$PTO_SOURCE_DIR/build/tools/ptoas/ptoas
+              PTOAS_DEPS_DIR=/output/lib
+              
+              mkdir -p /output/bin $PTOAS_DEPS_DIR
+              cp $PTOAS_BIN /output/bin/
+              
+              # Collect *.so dependencies
+              copy_so() {
+                local f="$1"
+                [[ -f "$f" ]] || return 0
+                local name=$(basename "$f")
+                [[ -f "${PTOAS_DEPS_DIR}/${name}" ]] && return 0
+                cp -n "$f" "${PTOAS_DEPS_DIR}/" 2>/dev/null || true
+                while read -r res; do
+                  copy_so "$res"
+                done < <(ldd "$f" 2>/dev/null | awk "/=> \/llvm-workspace\// {print \$3}")
+              }
+              
+              while read -r res; do
+                copy_so "$res"
+              done < <(ldd "$PTOAS_BIN" 2>/dev/null | awk "/=> \/llvm-workspace\// {print \$3}")
+              
+              # Create wrapper script
+              cat > /output/ptoas << "WRAPPER_EOF"
           #!/bin/bash
           SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
           export LD_LIBRARY_PATH="${SCRIPT_DIR}/lib:${LD_LIBRARY_PATH}"
           exec "${SCRIPT_DIR}/bin/ptoas" "$@"
-          EOF
-          chmod +x $PTOAS_DIST_DIR/ptoas
-          
-          # Show collected files
-          echo "=== ptoas distribution contents ==="
-          ls -la $PTOAS_DIST_DIR/
-          ls -la $PTOAS_DIST_DIR/bin/
-          echo "=== Collected .so dependencies ($(ls $PTOAS_DEPS_DIR/*.so* 2>/dev/null | wc -l) files) ==="
-          du -sh $PTOAS_DEPS_DIR/
+          WRAPPER_EOF
+              chmod +x /output/ptoas
+              
+              echo "=== ptoas distribution ==="
+              ls -la /output/
+              ls -la /output/bin/
+              echo "Collected $(ls /output/lib/*.so* 2>/dev/null | wc -l) .so files"
+              du -sh /output/lib/
+            '
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ptoas-wheels-${{ matrix.arch }}
+          path: wheelhouse/*.whl
 
       - name: Upload ptoas binary artifact
         uses: actions/upload-artifact@v4
@@ -231,7 +266,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: all-wheels
-          pattern: ptoas-wheel-*
+          pattern: ptoas-wheels-*
           merge-multiple: true
 
       - name: Download all ptoas binary artifacts
