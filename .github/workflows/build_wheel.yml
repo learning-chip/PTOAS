@@ -18,7 +18,7 @@ on:
     - cron: "10 17 * * *"
   workflow_dispatch:
   release:
-    types: [prereleased, released]
+    types: [prereleased, released, created]
 
 permissions:
   contents: write
@@ -56,13 +56,20 @@ jobs:
           echo "PY_PATH=/opt/python/$PY_VER" >> $GITHUB_ENV
 
       - name: Compute PTOAS CLI version
+        env:
+          RELEASE_IS_DRAFT: ${{ github.event.release.draft }}
         run: |
           if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
-            EXPECTED_RELEASE_VERSION="$(${PY_PATH}/bin/python .github/scripts/compute_ptoas_version.py --mode release)"
-            PTOAS_VERSION="${GITHUB_REF_NAME#v}"
-            if [ "${PTOAS_VERSION}" != "${EXPECTED_RELEASE_VERSION}" ]; then
-              echo "release tag '${GITHUB_REF_NAME}' does not match computed version '${EXPECTED_RELEASE_VERSION}'" >&2
-              exit 1
+            if [ "${RELEASE_IS_DRAFT}" = "true" ]; then
+              # Draft saves: build with release mode but do not enforce tag vs computed version.
+              PTOAS_VERSION="$(${PY_PATH}/bin/python .github/scripts/compute_ptoas_version.py --mode release)"
+            else
+              EXPECTED_RELEASE_VERSION="$(${PY_PATH}/bin/python .github/scripts/compute_ptoas_version.py --mode release)"
+              PTOAS_VERSION="${GITHUB_REF_NAME#v}"
+              if [ "${PTOAS_VERSION}" != "${EXPECTED_RELEASE_VERSION}" ]; then
+                echo "release tag '${GITHUB_REF_NAME}' does not match computed version '${EXPECTED_RELEASE_VERSION}'" >&2
+                exit 1
+              fi
             fi
           else
             PTOAS_VERSION="$(${PY_PATH}/bin/python .github/scripts/compute_ptoas_version.py --mode dev)"
