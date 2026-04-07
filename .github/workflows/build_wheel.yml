@@ -18,7 +18,7 @@ on:
     - cron: "10 17 * * *"
   workflow_dispatch:
   release:
-    types: [prereleased, released, created]
+    types: [prereleased, released, created, edited]
 
 permissions:
   contents: write
