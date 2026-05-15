@@ -171,38 +171,37 @@ def online_softmax_update_kernel_2d(
                 oldmax_bc = pto.vbrc_load(ub_om, row, vf32)
                 oldsum_bc = pto.vbrc_load(ub_os, row, vf32)
 
-                # scf.for with iter_args: accumulate (running_max, running_sum)
-                with pto.for_(c0, c128, step=c64, iter_args=(oldmax_bc, oldsum_bc)) as loop:
-                    chunk                    = loop.iv
-                    running_max, running_sum = loop.iter_args
-
+                # Accumulate (running_max, running_sum) over 64-element chunks.
+                # pto.reduce maps to scf.for with iter_args; the step function
+                # returns the updated state, mirroring the IR's scf.yield.
+                def chunk_step(chunk, rmax, rsum):
                     chunk_i32      = s.index_cast(pto.int32, chunk)
                     remaining_cols = s.subi(arg7, chunk_i32)
                     has_chunk      = s.cmpi_sgt(remaining_cols, c0_i32)
 
-                    # scf.if with results – produce (next_max, next_sum)
-                    with pto.if_(has_chunk, results=(vf32, vf32)) as br:
-                        with br.then_:
-                            chunk_mask, _      = pto.plt_b32(remaining_cols)
-                            chunk_base         = s.addi(row_qk, chunk)
-                            vec                = pto.vlds(ub_qk, chunk_base, vf32)
-                            chunk_max          = pto.vcmax(vec, chunk_mask)
-                            chunk_max_bc       = pto.vdup(chunk_max, active, position="LOWEST")
-                            merged_max         = pto.vmax(running_max, chunk_max_bc, active)
-                            scaled_running     = pto.vexpdif(running_max, merged_max, active)
-                            running_sum_scaled = pto.vmul(scaled_running, running_sum, active)
-                            chunk_exp          = pto.vexpdif(vec, merged_max, chunk_mask)
-                            chunk_sum          = pto.vcadd(chunk_exp, chunk_mask)
-                            chunk_sum_bc       = pto.vdup(chunk_sum, active, position="LOWEST")
-                            merged_sum         = pto.vadd(running_sum_scaled, chunk_sum_bc, active)
-                            pto.yield_(merged_max, merged_sum)
-                        with br.else_:
-                            pto.yield_(running_max, running_sum)
+                    # pto.cond maps to scf.if with results; then_ emits ops,
+                    # else_ is trivial (passes state through unchanged).
+                    def compute_chunk():
+                        chunk_mask, _      = pto.plt_b32(remaining_cols)
+                        chunk_base         = s.addi(row_qk, chunk)
+                        vec                = pto.vlds(ub_qk, chunk_base, vf32)
+                        chunk_max          = pto.vcmax(vec, chunk_mask)
+                        chunk_max_bc       = pto.vdup(chunk_max, active, position="LOWEST")
+                        merged_max         = pto.vmax(rmax, chunk_max_bc, active)
+                        scaled_running     = pto.vexpdif(rmax, merged_max, active)
+                        running_sum_scaled = pto.vmul(scaled_running, rsum, active)
+                        chunk_exp          = pto.vexpdif(vec, merged_max, chunk_mask)
+                        chunk_sum          = pto.vcadd(chunk_exp, chunk_mask)
+                        chunk_sum_bc       = pto.vdup(chunk_sum, active, position="LOWEST")
+                        merged_sum         = pto.vadd(running_sum_scaled, chunk_sum_bc, active)
+                        return merged_max, merged_sum
 
-                    next_max, next_sum = br.results
-                    pto.yield_(next_max, next_sum)
+                    return pto.cond(has_chunk,
+                        then_=compute_chunk,
+                        else_=lambda: (rmax, rsum))
 
-                final_max, final_sum = loop.results
+                final_max, final_sum = pto.fori_loop(
+                    c0, c128, chunk_step, (oldmax_bc, oldsum_bc), step=c64)
 
                 # Compute per-row expmax scalar
                 raw_em  = pto.vexpdif(oldmax_bc, final_max, active)

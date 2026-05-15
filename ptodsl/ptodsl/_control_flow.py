@@ -6,17 +6,22 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 """
-Control-flow context managers for PTO kernels.
+Control-flow context managers and functional helpers for PTO kernels.
 
-All CMs work with the current MLIR insertion point; no context threading needed.
+All helpers work with the current MLIR insertion point; no context threading needed.
 
 Public API
 ──────────
-``vecscope()``            – ``pto.vecscope { … }``
-``for_(lo, hi, step, *, iter_args)``
-                          – ``scf.for`` with optional iter_args
-``if_(cond, *, results)`` – ``scf.if`` with optional results + else
-``yield_(*vals)``         – ``scf.yield``
+``vecscope()``              – ``pto.vecscope { … }``
+``for_(lo, hi, *, step)``   – simple ``scf.for`` (yields induction variable)
+``if_(cond)``               – simple ``scf.if`` without results
+``reduce(lo, hi, *, step, init, fn)``
+                            – ``scf.for`` with iter_args expressed as a fold:
+                              ``fn(iv, *state) → new_state``
+``cond(condition, then_, else_)``
+                            – ``scf.if`` with results expressed as a conditional:
+                              each branch is a zero-arg callable returning values
+``yield_(*vals)``           – ``scf.yield``
 """
 
 from ._bootstrap import make_context  # noqa: F401
@@ -47,174 +52,154 @@ def vecscope() -> _VecScopeCM:
     return _VecScopeCM()
 
 
-# ── for_ ──────────────────────────────────────────────────────────────────────
-
-class LoopHandle:
-    """
-    Handle for a ``scf.for`` loop with iter_args.
-
-    Attributes available *after* the ``with pto.for_(…) as loop:`` block::
-
-        loop.iv         – induction variable
-        loop.iter_args  – tuple of inner (mutable) SSA values
-        loop.results    – tuple of ForOp results (after loop exit)
-    """
-
-    def __init__(self, for_op):
-        self._op = for_op
-
-    @property
-    def iv(self):
-        return self._op.induction_variable
-
-    @property
-    def iter_args(self):
-        return tuple(self._op.inner_iter_args)
-
-    @property
-    def results(self):
-        return tuple(self._op.results)
-
+# ── for_ (simple loop) ────────────────────────────────────────────────────────
 
 class _ForCM:
-    def __init__(self, start, stop, step, iter_args):
+    def __init__(self, start, stop, step):
         self._start = start
         self._stop = stop
         self._step = step
-        self._iter_args = list(iter_args) if iter_args is not None else []
         self._for_op = None
         self._ip = None
 
     def __enter__(self):
-        self._for_op = scf.ForOp(
-            self._start, self._stop, self._step,
-            self._iter_args if self._iter_args else None,
-        )
+        self._for_op = scf.ForOp(self._start, self._stop, self._step)
         self._ip = InsertionPoint(self._for_op.body)
         self._ip.__enter__()
-        if not self._iter_args:
-            return self._for_op.induction_variable
-        return LoopHandle(self._for_op)
+        return self._for_op.induction_variable
 
     def __exit__(self, *exc):
-        if not self._iter_args:
-            scf.YieldOp([])
+        scf.YieldOp([])
         self._ip.__exit__(*exc)
 
 
-def for_(start, stop, *, step, iter_args=None) -> _ForCM:
+def for_(start, stop, *, step) -> _ForCM:
     """
-    ``scf.for`` context manager.
-
-    Without ``iter_args`` – yields the induction variable; ``scf.yield`` is
-    inserted automatically::
+    Simple ``scf.for`` context manager.  Yields the induction variable;
+    ``scf.yield`` is inserted automatically on exit::
 
         with pto.for_(c0, c16, step=c1) as i:
+            off = pto.scalar.muli(i, c64)
             ...
 
-    With ``iter_args`` – yields a :class:`LoopHandle`; the caller must emit
-    ``pto.yield_(…)`` before the block closes::
-
-        with pto.for_(c0, c128, step=c64, iter_args=(a, b)) as loop:
-            x, y = loop.iter_args
-            ...
-            pto.yield_(nx, ny)
-        fa, fb = loop.results
+    For loops that carry loop-carried values (iter_args), use
+    :func:`reduce` instead.
     """
-    return _ForCM(start, stop, step, iter_args)
+    return _ForCM(start, stop, step)
 
 
-# ── if_ ───────────────────────────────────────────────────────────────────────
+# ── fori_loop – scf.for with iter_args as a functional fold ──────────────────
 
-class _BlockCM:
-    """Enters the InsertionPoint of a single block for ``with br.then_:`` style."""
-
-    def __init__(self, block):
-        self._block = block
-        self._ip = None
-
-    def __enter__(self):
-        self._ip = InsertionPoint(self._block)
-        self._ip.__enter__()
-
-    def __exit__(self, *exc):
-        self._ip.__exit__(*exc)
-
-
-class BranchHandle:
+def fori_loop(lower, upper, body_fun, init_val, *, step):
     """
-    Handle for ``scf.if`` with results and an else branch.
+    ``scf.for`` with iter_args, modelled after ``jax.lax.fori_loop``.
 
-    Usage::
+    Signature mirrors JAX::
 
-        with pto.if_(cond, results=(vf32, vf32)) as br:
-            with br.then_:
-                ...
-                pto.yield_(a, b)
-            with br.else_:
-                pto.yield_(c, d)
-        x, y = br.results
+        fori_loop(lower, upper, body_fun, init_val, *, step)
+
+    ``body_fun(iv, *state) → new_state`` is called once with the InsertionPoint
+    set to the loop body; the returned values become the ``scf.yield`` operands.
+    ``init_val`` is the initial loop-carried state (a tuple or single value).
+
+    Returns the final state after the loop (tuple, or a single value if
+    ``init_val`` was a single value)::
+
+        final_max, final_sum = pto.fori_loop(
+            c0, c128, chunk_step, (oldmax_bc, oldsum_bc), step=c64
+        )
+        # where: def chunk_step(chunk, rmax, rsum): … return new_max, new_sum
     """
+    init_vals = list(init_val) if isinstance(init_val, (tuple, list)) else [init_val]
+    for_op = scf.ForOp(lower, upper, step, init_vals)
+    with InsertionPoint(for_op.body):
+        iv    = for_op.induction_variable
+        state = tuple(for_op.inner_iter_args)
+        new_state = body_fun(iv, *state)
+        new_state = list(new_state) if isinstance(new_state, (tuple, list)) else [new_state]
+        scf.YieldOp(new_state)
+    results = tuple(for_op.results)
+    return results if len(results) != 1 else results[0]
 
-    def __init__(self, if_op):
-        self._op = if_op
-        self.then_ = _BlockCM(if_op.then_block)
-        self.else_ = _BlockCM(if_op.else_block)
 
-    @property
-    def results(self):
-        return tuple(self._op.results)
-
+# ── if_ (simple conditional, no results) ─────────────────────────────────────
 
 class _IfCM:
-    def __init__(self, cond, result_types):
-        self._cond = cond
-        self._result_types = [_resolve(t) for t in result_types] if result_types else []
+    def __init__(self, cond_val):
+        self._cond = cond_val
         self._if_op = None
         self._ip = None
 
     def __enter__(self):
-        if self._result_types:
-            # if/else with results: create IfOp but don't enter any block;
-            # the caller manages blocks via br.then_ / br.else_
-            self._if_op = scf.IfOp(self._cond, self._result_types, hasElse=True)
-            return BranchHandle(self._if_op)
-        else:
-            # simple if without results: enter then_block automatically
-            self._if_op = scf.IfOp(self._cond)
-            self._ip = InsertionPoint(self._if_op.then_block)
-            self._ip.__enter__()
-            return None
+        self._if_op = scf.IfOp(self._cond)
+        self._ip = InsertionPoint(self._if_op.then_block)
+        self._ip.__enter__()
+        return None
 
     def __exit__(self, *exc):
-        if not self._result_types:
-            scf.YieldOp([])
-            self._ip.__exit__(*exc)
-        # for if/else with results: blocks are managed by BranchHandle; nothing to do
+        scf.YieldOp([])
+        self._ip.__exit__(*exc)
 
 
-def if_(cond, *, results=None) -> _IfCM:
+def if_(cond_val) -> _IfCM:
     """
-    ``scf.if`` context manager.
-
-    Without ``results`` – simple if with no else; ``scf.yield`` is inserted
-    automatically::
+    Simple ``scf.if`` without results.  ``scf.yield`` is inserted
+    automatically on exit::
 
         with pto.if_(has_rows):
+            pto.tload(part, tile)
             ...
 
-    With ``results`` – if/else pair that produces SSA values; the caller must
-    manage ``br.then_`` and ``br.else_`` and emit ``pto.yield_(…)`` in each::
-
-        with pto.if_(has_chunk, results=(vf32, vf32)) as br:
-            with br.then_:
-                ...
-                pto.yield_(merged_max, merged_sum)
-            with br.else_:
-                pto.yield_(running_max, running_sum)
-        x, y = br.results
+    For conditionals that produce values, use :func:`cond` instead.
     """
-    return _IfCM(cond, results)
+    return _IfCM(cond_val)
+
+
+# ── cond – scf.if with results as a conditional expression ───────────────────
+
+def _to_list(vals):
+    """Normalise a single value or a tuple/list to a list."""
+    return list(vals) if isinstance(vals, (tuple, list)) else [vals]
+
+
+def cond(condition, then_, else_):
+    """
+    ``scf.if`` with results expressed as a conditional expression.
+
+    ``then_()`` and ``else_()`` are zero-arg callables that emit MLIR ops
+    and return their result values (tuple or single value).
+
+    **Type inference**: ``else_`` is called *once* outside any block before
+    the IfOp is created to discover the result types.  ``else_`` must
+    therefore be non-emitting at that call (the typical ``lambda: (a, b)``
+    pattern satisfies this automatically).  Both branches are then called
+    properly inside their respective blocks.
+
+    Usage::
+
+        next_max, next_sum = pto.cond(
+            has_chunk,
+            then_=compute_chunk,              # def that emits ops
+            else_=lambda: (rmax, rsum),       # trivial: just passes state through
+        )
+    """
+    # ── Type inference pass (else_ must not emit ops here) ──
+    hint       = _to_list(else_())
+    res_types  = [v.type for v in hint]
+
+    # ── Create the IfOp at the current insertion point ──────
+    if_op = scf.IfOp(condition, res_types, hasElse=True)
+
+    # ── Fill the then-block ──────────────────────────────────
+    with InsertionPoint(if_op.then_block):
+        scf.YieldOp(_to_list(then_()))
+
+    # ── Fill the else-block ──────────────────────────────────
+    with InsertionPoint(if_op.else_block):
+        scf.YieldOp(_to_list(else_()))
+
+    results = tuple(if_op.results)
+    return results if len(results) != 1 else results[0]
 
 
 # ── yield_ ────────────────────────────────────────────────────────────────────
@@ -225,6 +210,8 @@ def yield_(*vals):
 
 
 __all__ = [
-    "vecscope", "LoopHandle", "BranchHandle",
-    "for_", "if_", "yield_",
+    "vecscope",
+    "for_", "fori_loop",
+    "if_", "cond",
+    "yield_",
 ]

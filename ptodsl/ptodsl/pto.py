@@ -47,8 +47,9 @@ from ._ops import (             # noqa: F401
 # ── Control flow ──────────────────────────────────────────────────────────────
 from ._control_flow import (    # noqa: F401
     vecscope,
-    for_, if_, yield_,
-    LoopHandle, BranchHandle,
+    for_, fori_loop,
+    if_, cond,
+    yield_,
 )
 
 # ── Decorator ─────────────────────────────────────────────────────────────────

@@ -144,23 +144,42 @@ with pto.vecscope():                # pto.vecscope { … }
 with pto.for_(c0, c16, step=c1) as i:     # simple scf.for
     ...                                    # scf.yield inserted automatically
 
-with pto.for_(c0, c128, step=c64, iter_args=(a, b)) as loop:
-    x, y = loop.iter_args
-    ...
-    pto.yield_(nx, ny)             # scf.yield with values
-fx, fy = loop.results
-
-with pto.if_(has_rows):            # simple scf.if
+with pto.if_(has_rows):            # simple scf.if, no results
     ...                             # scf.yield inserted automatically
-
-with pto.if_(has_chunk, results=(vf32, vf32)) as br:
-    with br.then_:
-        ...
-        pto.yield_(merged_max, merged_sum)
-    with br.else_:
-        pto.yield_(running_max, running_sum)
-x, y = br.results
 ```
+
+**Loops with loop-carried state** and **conditionals that produce values** use
+a functional style inspired by [`jax.lax.fori_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.fori_loop.html)
+and `jax.lax.cond`.  This avoids the `loop.iv` / `loop.iter_args` / `pto.yield_()` / `loop.results`
+boilerplate that would otherwise be needed for `scf.for` with `iter_args`, and
+the nested `with br.then_:` / `with br.else_:` / `br.results` ceremony for
+`scf.if` with results:
+
+```python
+# pto.fori_loop  →  scf.for with iter_args
+# Signature mirrors jax.lax.fori_loop(lower, upper, body_fun, init_val).
+# body_fun(iv, *state) → new_state; scf.yield emitted automatically.
+# `step` is keyword-only (JAX always steps by 1; MLIR requires an explicit step value).
+final_max, final_sum = pto.fori_loop(
+    c0, c128,
+    chunk_step,                      # def chunk_step(chunk, rmax, rsum) -> (new_max, new_sum)
+    (oldmax_bc, oldsum_bc),          # init_val
+    step=c64,
+)
+
+# pto.cond  →  scf.if with results + else
+# then_() and else_() are zero-arg callables; scf.yield emitted automatically.
+next_max, next_sum = pto.cond(
+    has_chunk,
+    then_=compute_chunk,             # def that emits ops and returns values
+    else_=lambda: (rmax, rsum),      # trivial pass-through of current state
+)
+```
+
+`pto.cond` infers result types by calling `else_` once before creating the
+``scf.if`` op — safe when `else_` is a trivial lambda that returns existing
+SSA values (the common pattern).  For a non-trivial `else_`, pass explicit
+types via `pto.cond(cond, then_=…, else_=…, types=(t1, t2))`.
 
 ### Scalar arithmetic (`s = pto.scalar`)
 
