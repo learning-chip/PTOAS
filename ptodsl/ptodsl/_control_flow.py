@@ -15,7 +15,7 @@ Public API
 ``vecscope()``              – ``pto.vecscope { … }``
 ``for_(lo, hi, *, step)``   – simple ``scf.for`` (yields induction variable)
 ``if_(cond)``               – simple ``scf.if`` without results
-``reduce(lo, hi, *, step, init, fn)``
+``fori_loop(lower, upper, body_fun, init_val, *, step)``
                             – ``scf.for`` with iter_args expressed as a fold:
                               ``fn(iv, *state) → new_state``
 ``cond(condition, then_, else_)``
@@ -83,7 +83,7 @@ def for_(start, stop, *, step) -> _ForCM:
             ...
 
     For loops that carry loop-carried values (iter_args), use
-    :func:`reduce` instead.
+    :func:`fori_loop` instead.
     """
     return _ForCM(start, stop, step)
 
