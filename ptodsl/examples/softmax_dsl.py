@@ -172,7 +172,7 @@ def online_softmax_update_kernel_2d(
                 oldsum_bc = pto.vbrc_load(ub_os, row, vf32)
 
                 # Accumulate (running_max, running_sum) over 64-element chunks.
-                # pto.reduce maps to scf.for with iter_args; the step function
+                # pto.fori_loop maps to scf.for with iter_args; the step function
                 # returns the updated state, mirroring the IR's scf.yield.
                 def chunk_step(chunk, rmax, rsum):
                     chunk_i32      = s.index_cast(pto.int32, chunk)
