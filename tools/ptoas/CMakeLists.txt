@@ -20,6 +20,10 @@ set(LLVM_LINK_COMPONENTS
 # 原因：LLVM 构建目录里已经有一个 ptoas 了，重名会导致 CMake 报错。
 add_llvm_executable(pto-opt
   ptoas.cpp
+  driver.cpp
+  VPTOHostStubEmission.cpp
+  ObjectEmission.cpp
+  TilelangDaemon.cpp
 )
 # =========================================================
 # [新增] 魔法操作：修改最终输出的文件名为 "ptoas"
@@ -27,6 +31,12 @@ add_llvm_executable(pto-opt
 set_target_properties(pto-opt PROPERTIES OUTPUT_NAME "ptoas")
 target_compile_definitions(pto-opt PRIVATE
   PTOAS_RELEASE_VERSION="${PTOAS_CLI_VERSION}"
+  # Source-tree defaults for TileLang DSL expansion. These let ptoas run
+  # directly from the build tree without passing --tilelang-path /
+  # --tilelang-pkg-path. Installed layouts that move these directories
+  # still need to override the flags explicitly.
+  PTOAS_DEFAULT_TILELANG_PATH="${CMAKE_SOURCE_DIR}/lib/TileOps"
+  PTOAS_DEFAULT_TILELANG_PKG_PATH="${CMAKE_SOURCE_DIR}/tilelang-dsl/python"
 )
 # [修改 2] 更新链接库名称
 # 原因：In-tree 时你的库叫 MLIRPTODialect，但现在 Out-of-tree 它们是你自己定义的
@@ -68,4 +78,9 @@ target_link_libraries(pto-opt PRIVATE
 # "PTOOpsIncGen" 这个名字必须和你 include/PTO/IR/CMakeLists.txt 里定义的 add_public_tablegen_target 一致
 add_dependencies(pto-opt
   PTOOpsIncGen 
+)
+
+install(TARGETS pto-opt
+  RUNTIME DESTINATION bin
+  COMPONENT PTOAS_Runtime
 )

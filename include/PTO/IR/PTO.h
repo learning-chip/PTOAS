@@ -47,6 +47,7 @@
 //===----------------------------------------------------------------------===//
  
 #include "PTO/IR/PTOInterfaces.h.inc"
+#include "PTO/IR/VPTOInterfaces.h.inc"
 
 //===----------------------------------------------------------------------===//
 // PTO Attributes
@@ -66,10 +67,70 @@
 // PTO Dialect Operations
 //===----------------------------------------------------------------------===//
 
+namespace mlir {
+namespace pto {
+
+//===----------------------------------------------------------------------===//
+// S Fractal Size Constants
+//===----------------------------------------------------------------------===//
+
+/// Fractal size for mxBox layout (16x2 inner block, 32 bytes total).
+inline constexpr int32_t kFractalMxSize = 32;
+
+/// Fractal size for AB matrices in matmul (16xN inner block, 512 bytes).
+inline constexpr int32_t kFractalABSize = 512;
+
+/// Fractal size for C matrix in matmul (16x16 inner block, 1024 bytes).
+inline constexpr int32_t kFractalCSize = 1024;
+
+struct DmaLoopConfig {
+  Value count;
+  Value srcStride;
+  Value dstStride;
+};
+
+struct DmaPadConfig {
+  Value value;
+  Value leftCount;
+  Value rightCount;
+};
+
+struct AccStoreModeConfig {
+  AccStoreMode mode;
+  std::optional<Value> split;
+  std::optional<Value> loop0SrcStride;
+};
+
+struct CubeLoadFracShapeConfig {
+  Value nValue;
+  Value dValue;
+};
+
+struct CubeLoadFracSrcLayoutConfig {
+  Value srcInnerStride;
+  std::optional<Value> srcOuterStride;
+};
+
+struct CubeLoadFracDstGroupConfig {
+  Value groupCount;
+  Value dstLoop2Stride;
+  Value dstLoop3Stride;
+  Value dstLoop4Stride;
+};
+
+struct CubeLoadFracCtrlConfig {
+  Value l2CacheCtrl;
+  Value smallc0En;
+};
+
+} // namespace pto
+} // namespace mlir
+
 #define GET_OP_CLASSES
 #include "PTO/IR/PTOOps.h.inc"
 
 namespace mlir {
+class MLIRContext;
 class TypeConverter;
 
 namespace pto {
@@ -101,34 +162,84 @@ enum class PTOParserTargetArch {
   A5,
 };
 
-void setPTOParserTargetArch(PTOParserTargetArch arch);
-PTOParserTargetArch getPTOParserTargetArch();
+void setPTOParserTargetArch(MLIRContext *context, PTOParserTargetArch arch);
+PTOParserTargetArch getPTOParserTargetArch(MLIRContext *context);
 
 class ScopedPTOParserTargetArch {
 public:
-  explicit ScopedPTOParserTargetArch(PTOParserTargetArch arch);
+  explicit ScopedPTOParserTargetArch(MLIRContext *context,
+                                     PTOParserTargetArch arch);
   ~ScopedPTOParserTargetArch();
 
 private:
+  MLIRContext *context;
   PTOParserTargetArch previousArch;
 };
 
 
-/// Function attribute that marks an explicit PTO kernel entry.
+/// Function attributes that mark an explicit PTO kernel entry.
 inline constexpr llvm::StringLiteral kPTOEntryAttrName = "pto.entry";
 inline constexpr llvm::StringLiteral kLegacyHACCEntryAttrName = "hacc.entry";
+inline constexpr llvm::StringLiteral kPTOKernelAttrName = "pto.kernel";
+inline constexpr llvm::StringLiteral kLegacyPTOAICoreAttrName = "pto.aicore";
+inline constexpr llvm::StringLiteral kPTOSimtEntryAttrName = "pto.simt_entry";
+inline constexpr llvm::StringLiteral kPTOSimtMaxThreadsAttrName =
+    "pto.simt_max_threads";
+inline constexpr llvm::StringLiteral kPTOSimtMaxRegistersAttrName =
+    "pto.simt_max_regs";
+inline constexpr llvm::StringLiteral kPTOVisibilityAttrName = "pto.visibility";
+inline constexpr llvm::StringLiteral kPTOVisibilityInternalValue = "internal";
+inline constexpr llvm::StringLiteral kPTOVisibilityExternalValue = "external";
+inline constexpr llvm::StringLiteral kPTODSLLogicalNameAttrName =
+    "pto.ptodsl.logical_name";
 
-/// Return true if the function carries an explicit entry marker.
+/// Return the PTODSL logical function name when present, otherwise fall back to
+/// the current symbol name. PTODSL uses this to mark ABI-specialized helper and
+/// kernel-module symbols without relying on symbol-name parsing.
+inline StringRef getPTODSLLogicalNameOrSymbolName(func::FuncOp func) {
+  if (!func)
+    return {};
+  if (auto attr = func->getAttrOfType<StringAttr>(kPTODSLLogicalNameAttrName))
+    return attr.getValue();
+  return func.getSymName();
+}
+
+/// Return true if the function carries an explicit entry marker. PTO accepts
+/// both the EmitC naming (`pto.entry`) and VPTO naming (`pto.kernel`) as entry
+/// aliases; `hacc.entry` and `pto.aicore` are legacy aliases.
 bool hasExplicitPTOEntryAttr(func::FuncOp func);
+bool hasExplicitPTOEntryAttr(LLVM::LLVMFuncOp func);
 
 /// Return true if the function should be emitted as an AICORE entry.
 bool isPTOEntryFunction(func::FuncOp func);
+bool isPTOEntryFunction(LLVM::LLVMFuncOp func);
+
+/// Return true if the function should remain externally visible in backend
+/// artifacts. PTO entries are always treated as externally visible. Non-entry
+/// functions default to internal visibility unless they carry
+/// `pto.visibility = "external"`.
+bool hasExternalArtifactVisibility(func::FuncOp func);
+
+/// Set explicit artifact visibility on one function definition.
+void setExternalArtifactVisibility(func::FuncOp func, bool isExternal);
 
 /// Validate module-level PTO entry configuration before EmitC lowering.
 LogicalResult validatePTOEntryFunctions(ModuleOp module);
 
-/// Materialize the effective PTO entry selection onto function attributes.
+/// Compatibility hook kept for existing pass pipelines. This is now a no-op
+/// because PTO entry state is expressed directly through explicit entry attrs
+/// such as ``pto.entry``.
 void annotatePTOEntryFunctions(ModuleOp module);
+
+/// Look up a peer function for import_reserved_buffer-style cross-kernel links.
+/// This first honors ordinary nearest symbol lookup, then falls back to the
+/// outer backend-partitioned container and PTODSL ABI-specialized public
+/// helper symbols when needed.
+func::FuncOp lookupPeerFuncAcrossContainer(Operation *op,
+                                           FlatSymbolRefAttr peerAttr);
+
+/// Find one reserve_buffer by logical name inside a function.
+ReserveBufferOp findReserveBufferByName(func::FuncOp funcOp, StringRef name);
 
 } // namespace pto
 } // namespace mlir

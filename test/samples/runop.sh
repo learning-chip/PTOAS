@@ -17,9 +17,10 @@ PTOAS_BIN="${PTOAS_BIN:-}"
 PTOBC_BIN="${PTOBC_BIN:-}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 PTOAS_OUT_DIR="${PTOAS_OUT_DIR:-}"
+PTO_BUILD_DIR="${PTO_BUILD_DIR:-}"
 PTOAS_ENABLE_INSERT_SYNC="${PTOAS_ENABLE_INSERT_SYNC:-1}"
 PTOAS_FLAGS="${PTOAS_FLAGS:-}"
-PTO_PTO_DIRS="${PTO_PTO_DIRS:-Sync}"
+PTO_PTO_DIRS="${PTO_PTO_DIRS:-Sync Qwen3DecodeA3 Qwen3DecodeA5 DeepseekV4DecodeA3 DeepseekV4DecodeA5 CommSync Prelu Rem Rems Gemvmx MatmulMxLowPrecision TquantMx}"
 ENABLE_BC=0
 
 usage() {
@@ -34,9 +35,10 @@ Env:
   PTOBC_BIN   # path to ptobc executable (optional)
   PYTHON_BIN  # python executable to run samples (optional)
   PTOAS_OUT_DIR  # where generated *.mlir/*.cpp go (optional; defaults to a temp dir)
+  PTO_BUILD_DIR  # build directory root that contains tools/ptoas and tools/ptobc (optional)
   PTOAS_FLAGS  # extra flags passed to ptoas (e.g. --enable-insert-sync)
   PTOAS_ENABLE_INSERT_SYNC  # 1 to append --enable-insert-sync to PTOAS_FLAGS (default: 1)
-  PTO_PTO_DIRS  # space-separated dirs to run .pto directly (default: Sync)
+  PTO_PTO_DIRS  # space-separated dirs to run .pto directly (default: Sync Qwen3DecodeA3 Qwen3DecodeA5 DeepseekV4DecodeA3 DeepseekV4DecodeA5 CommSync Prelu Rem Rems Gemvmx MatmulMxLowPrecision TquantMx)
 
 Flags:
   --enablebc  # enable: python -> .pto -> ptobc -> .pto -> ptoas
@@ -68,6 +70,12 @@ resolve_ptoas_bin() {
   # - out-of-tree build in repo: PTOAS/build/tools/ptoas/ptoas
   # - legacy layout: build/bin/ptoas
   local cand
+  if [[ -n "${PTO_BUILD_DIR}" ]]; then
+    cand="${PTO_BUILD_DIR}/tools/ptoas/ptoas"
+    [[ -x "$cand" ]] && { echo "$cand"; return 0; }
+    cand="${PTO_BUILD_DIR}/bin/ptoas"
+    [[ -x "$cand" ]] && { echo "$cand"; return 0; }
+  fi
   cand="${BASE_DIR}/../../build/tools/ptoas/ptoas"
   [[ -x "$cand" ]] && { echo "$cand"; return 0; }
   cand="${BASE_DIR}/../../../../build/bin/ptoas"
@@ -100,6 +108,12 @@ resolve_ptobc_bin() {
   fi
 
   local cand
+  if [[ -n "${PTO_BUILD_DIR}" ]]; then
+    cand="${PTO_BUILD_DIR}/tools/ptobc/ptobc"
+    [[ -x "$cand" ]] && { echo "$cand"; return 0; }
+    cand="${PTO_BUILD_DIR}/bin/ptobc"
+    [[ -x "$cand" ]] && { echo "$cand"; return 0; }
+  fi
   cand="${BASE_DIR}/../../build/tools/ptobc/ptobc"
   [[ -x "$cand" ]] && { echo "$cand"; return 0; }
   cand="${BASE_DIR}/../../build/bin/ptobc"
@@ -123,7 +137,7 @@ copy_validation_assets() {
     cp -f "${BASE_DIR}/validation_runtime.py" "${out_root}/validation_runtime.py"
   fi
 
-  for asset in "${sample_dir}"/*_golden.py "${sample_dir}"/*_compare.py; do
+  for asset in "${sample_dir}"/*_golden.py "${sample_dir}"/*_compare.py "${sample_dir}"/*_golden_*.py; do
     [[ -f "$asset" ]] || continue
     cp -f "$asset" "${out_sample_dir}/"
   done
@@ -153,6 +167,9 @@ process_one_dir() {
   if [[ "${ENABLE_BC}" == "1" ]]; then
     use_ptobc_roundtrip=1
   fi
+  if [[ "$A" == "Qwen3DecodeA3" || "$A" == "Qwen3DecodeA5" || "$A" == "DeepseekV4DecodeA3" || "$A" == "DeepseekV4DecodeA5" ]]; then
+    use_ptobc_roundtrip=0
+  fi
   local -a ptoas_flags=()
   if [[ -n "${PTOAS_FLAGS}" ]]; then
     # shellcheck disable=SC2206
@@ -172,18 +189,42 @@ process_one_dir() {
   fi
 
   local target_arch="a3"
+  local has_pto_arch_override=0
+  local has_pto_level_override=0
   if ((${#ptoas_flags[@]})); then
     for ((idx=0; idx<${#ptoas_flags[@]}; ++idx)); do
       if [[ "${ptoas_flags[idx]}" == "--pto-arch" && $((idx + 1)) -lt ${#ptoas_flags[@]} ]]; then
         target_arch="${ptoas_flags[idx + 1]}"
+        has_pto_arch_override=1
       elif [[ "${ptoas_flags[idx]}" == --pto-arch=* ]]; then
         target_arch="${ptoas_flags[idx]#--pto-arch=}"
+        has_pto_arch_override=1
+      elif [[ "${ptoas_flags[idx]}" == "--pto-level" && $((idx + 1)) -lt ${#ptoas_flags[@]} ]]; then
+        has_pto_level_override=1
+      elif [[ "${ptoas_flags[idx]}" == --pto-level=* ]]; then
+        has_pto_level_override=1
       fi
     done
   fi
+  if [[ "$A" == "Qwen3DecodeA5" || "$A" == "DeepseekV4DecodeA5" ]]; then
+    if [[ $has_pto_arch_override -eq 0 ]]; then
+      ptoas_flags+=(--pto-arch a5)
+      target_arch="a5"
+    fi
+    if [[ $has_pto_level_override -eq 0 ]]; then
+      ptoas_flags+=(--pto-level=level3)
+    fi
+  elif [[ "$A" == "Qwen3DecodeA3" || "$A" == "DeepseekV4DecodeA3" ]]; then
+    if [[ $has_pto_level_override -eq 0 ]]; then
+      ptoas_flags+=(--pto-level=level3)
+    fi
+  fi
+
+  local target_arch_lc
+  target_arch_lc="$(printf '%s' "$target_arch" | tr '[:upper:]' '[:lower:]')"
   local expected_vec_barrier="pipe_barrier(PIPE_V)"
   local skip_vec_barrier=0
-  if [[ "$(printf '%s' "$target_arch" | tr '[:upper:]' '[:lower:]')" == "a5" ]]; then
+  if [[ "${target_arch_lc}" == "a5" ]]; then
     skip_vec_barrier=1
   fi
 
@@ -208,17 +249,67 @@ process_one_dir() {
     echo -e "${A}\tSKIP\tMissing dir: $dir"
     return 0
   fi
+  local soc_lc="${SOC_VERSION:-}"
+  soc_lc="$(printf '%s' "${soc_lc}" | tr '[:upper:]' '[:lower:]')"
+  if [[ ( "$A" == "Qwen3DecodeA3" || "$A" == "DeepseekV4DecodeA3" ) && "${target_arch_lc}" != "a3" ]]; then
+    local direct_case
+    for direct_case in "$dir"/*.pto; do
+      [[ -f "$direct_case" ]] || continue
+      case "$direct_case" in
+        *-pto-ir.pto) continue ;;
+      esac
+      echo -e "${A}($(basename "$direct_case"))\tSKIP\trequires --pto-arch=a3"
+    done
+    return 0
+  fi
+  if [[ ( "$A" == "Qwen3DecodeA3" || "$A" == "DeepseekV4DecodeA3" ) && -n "${soc_lc}" && ( "${soc_lc}" == *"a5"* || "${soc_lc}" == *"950"* ) ]]; then
+    local direct_case
+    for direct_case in "$dir"/*.pto; do
+      [[ -f "$direct_case" ]] || continue
+      case "$direct_case" in
+        *-pto-ir.pto) continue ;;
+      esac
+      echo -e "${A}($(basename "$direct_case"))\tSKIP\trequires A3 target SOC"
+    done
+    return 0
+  fi
+  if [[ ( "$A" == "Qwen3DecodeA5" || "$A" == "DeepseekV4DecodeA5" ) && "$(printf '%s' "$target_arch" | tr '[:upper:]' '[:lower:]')" != "a5" ]]; then
+    local direct_case
+    for direct_case in "$dir"/*.pto; do
+      [[ -f "$direct_case" ]] || continue
+      case "$direct_case" in
+        *-pto-ir.pto) continue ;;
+      esac
+      echo -e "${A}($(basename "$direct_case"))\tSKIP\trequires --pto-arch=a5"
+    done
+    return 0
+  fi
+  if [[ ( "$A" == "Qwen3DecodeA5" || "$A" == "DeepseekV4DecodeA5" ) && -n "${soc_lc}" && "${soc_lc}" != *"a5"* && "${soc_lc}" != *"950"* ]]; then
+    local direct_case
+    for direct_case in "$dir"/*.pto; do
+      [[ -f "$direct_case" ]] || continue
+      case "$direct_case" in
+        *-pto-ir.pto) continue ;;
+      esac
+      echo -e "${A}($(basename "$direct_case"))\tSKIP\trequires A5 target SOC"
+    done
+    return 0
+  fi
 
   # Run every .py file in this directory (no requirement that name matches folder).
   local f mlir ptobc_file decoded_pto cpp base overall=0
   for f in "$dir"/*.py; do
     [[ -f "$f" ]] || continue
     case "$(basename "$f")" in
-      *_golden.py|*_compare.py)
+      *_golden.py|*_compare.py|*_golden_*.py)
         continue
         ;;
     esac
     base="$(basename "$f" .py)"
+    if [[ -f "${dir}/${base}-pto.pto" ]]; then
+      echo -e "${A}(${base}.py)\tSKIP\tprefer checked-in direct PTO sample: ${base}-pto.pto"
+      continue
+    fi
     local expect_fail=0
     case "$base" in
       *_invalid|*_xfail) expect_fail=1 ;;
@@ -252,7 +343,12 @@ process_one_dir() {
       echo -e "${A}(${base}.py)\tSKIP\trequires --pto-arch=a5"
       continue
     fi
-    if [[ "$base" == "gemvmx" && "$(printf '%s' "$target_arch" | tr '[:upper:]' '[:lower:]')" != "a5" ]]; then
+    if [[ ( "$base" == "gemvmx" || "$base" == "matmul_mx_low_precision" ) && "$(printf '%s' "$target_arch" | tr '[:upper:]' '[:lower:]')" != "a5" ]]; then
+      echo -e "${A}(${base}.py)\tSKIP\trequires --pto-arch=a5"
+      continue
+    fi
+    if [[ ( "$base" == "mgather" || "$base" == "mscatter" ) && \
+          "${target_arch_lc}" != "a5" ]]; then
       echo -e "${A}(${base}.py)\tSKIP\trequires --pto-arch=a5"
       continue
     fi
@@ -270,6 +366,14 @@ process_one_dir() {
     fi
     if [[ "$base" == "test_intercore_sync_a3_missing_setffts" && "$(printf '%s' "$target_arch" | tr '[:upper:]' '[:lower:]')" != "a3" ]]; then
       echo -e "${A}(${base}.py)\tSKIP\trequires --pto-arch=a3"
+      continue
+    fi
+    if [[ ( "$base" == "test_tmov_col_major_16x1_align_a5" || \
+            "$base" == "test_tmov_row_major_1x16_control_a5" || \
+            "$base" == "decode_projection_incore_0" || \
+            "$base" == "rmsnorm_incore_0" ) && \
+          "${target_arch_lc}" != "a5" ]]; then
+      echo -e "${A}(${base}.py)\tSKIP\trequires --pto-arch=a5"
       continue
     fi
 
@@ -314,7 +418,22 @@ process_one_dir() {
     local pto_input="$mlir"
     ptobc_file="${out_subdir}/${base}.ptobc"
     decoded_pto="${out_subdir}/${base}-roundtrip.pto"
-    if [[ $use_ptobc_roundtrip -eq 1 ]]; then
+    local sample_use_ptobc_roundtrip="$use_ptobc_roundtrip"
+    # TODO(ptobc): alloc_tile addr operand is required by ptoas level3 for
+    # these A5 repro/control samples, but ptobc v0 currently rejects this
+    # form with "operand count mismatch for op: pto.alloc_tile".
+    #
+    # tcvt.py exercises explicit sat_mode coverage. Keep it in the generic
+    # roundtrip path once ptobc v0 understands the current tcvt schema.
+    if [[ "$base" == "test_tmov_col_major_16x1_align_a5" || \
+          "$base" == "test_tmov_row_major_1x16_control_a5" || \
+          "$base" == "decode_projection_incore_0" || \
+          "$base" == "rmsnorm_incore_0" || \
+          "$base" == "tprefetch_async_binding" || \
+          "$base" == "syncall_binding" ]]; then
+      sample_use_ptobc_roundtrip=0
+    fi
+    if [[ $sample_use_ptobc_roundtrip -eq 1 ]]; then
       # Allow generic escape for ops that are not yet in the compact v0 opcode table.
       if ! PTOBC_ALLOW_GENERIC=1 "$ptobc" encode "$mlir" -o "$ptobc_file" >/dev/null 2>&1; then
         if [[ $expect_fail -eq 1 ]]; then
@@ -339,6 +458,30 @@ process_one_dir() {
 
     # Write output via -o to avoid mixing debug prints with generated C++.
     local -a ptoas_cmd=("${ptoas_cmd_base[@]}" "$pto_input" -o "$cpp")
+    if [[ "$base" == "syncall_binding" ]]; then
+      local sample_has_level3=0
+      for ((i=0; i<${#ptoas_cmd[@]}; i++)); do
+        if [[ "${ptoas_cmd[$i]}" == "--pto-level=level3" ]]; then
+          sample_has_level3=1
+          break
+        fi
+        if [[ "${ptoas_cmd[$i]}" == "--pto-level" ]]; then
+          if (( i + 1 < ${#ptoas_cmd[@]} )) && [[ "${ptoas_cmd[$((i+1))]}" == "level3" ]]; then
+            sample_has_level3=1
+            break
+          fi
+        fi
+      done
+      if [[ $sample_has_level3 -eq 0 ]]; then
+        ptoas_cmd=("$ptoas")
+        if (( ${#ptoas_flags[@]} )); then
+          ptoas_cmd+=(--pto-level=level3 "${ptoas_flags[@]}")
+        else
+          ptoas_cmd+=(--pto-level=level3)
+        fi
+        ptoas_cmd+=("$pto_input" -o "$cpp")
+      fi
+    fi
     local ptoas_log="${out_subdir}/${base}-ptoas.log"
     if ! "${ptoas_cmd[@]}" >"${ptoas_log}" 2>&1; then
       if [[ $expect_fail -eq 1 ]]; then
@@ -363,11 +506,11 @@ process_one_dir() {
       continue
     fi
 
-    # Regression guard: SubsetOp valid-shape inference must not produce 0.
+    # Regression guard: SubViewOp valid-shape inference must not produce 0.
     # This breaks downstream NPU compilation (e.g. vadd_pto_pingpong workspace ping/pong).
     if [[ "$base" == "vadd_pto_pingpong" ]]; then
       if grep -Fq ", 0, SLayout" "$cpp"; then
-        echo -e "${A}(${base}.py)\tFAIL\tgenerated tile has valid dim 0 (subset valid-shape bug)"
+        echo -e "${A}(${base}.py)\tFAIL\tgenerated tile has valid dim 0 (subview valid-shape bug)"
         overall=1
         continue
       fi
@@ -630,6 +773,58 @@ process_one_dir() {
       fi
     fi
 
+    # A5 TMOV alignment repro/control samples:
+    # - col_major 16x1 should be normalized into TRESHAPE + TMOV(row_major)
+    # - row_major 1x16 control should keep direct TMOV path without reshape
+    if [[ "$base" == "test_tmov_col_major_16x1_align_a5" ]]; then
+      if ! grep -Eq "\\bTMOV\\(" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing TMOV() in col_major repro sample"
+        overall=1
+        continue
+      fi
+      if ! grep -Fq "TRESHAPE(" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing TRESHAPE() normalization in col_major repro sample"
+        overall=1
+        continue
+      fi
+      if ! grep -Fq "Tile<TileType::Vec, float, 1, 16, BLayout::RowMajor" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing 1x16 RowMajor reinterpret tile in col_major repro sample"
+        overall=1
+        continue
+      fi
+    fi
+    if [[ "$base" == "test_tmov_row_major_1x16_control_a5" ]]; then
+      if ! grep -Eq "\\bTMOV\\(" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing TMOV() in row_major control sample"
+        overall=1
+        continue
+      fi
+      if ! grep -Fq "Tile<TileType::Vec, float, 1, 16, BLayout::RowMajor" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing 1x16 RowMajor tile in row_major control sample"
+        overall=1
+        continue
+      fi
+      if grep -Fq "TRESHAPE(" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tunexpected TRESHAPE() in row_major control sample"
+        overall=1
+        continue
+      fi
+    fi
+    # A5 regressions from real kernels (decode/rmsnorm):
+    # dangerous vec->vec col_major TMOV should be normalized into TRESHAPE + TMOV(row_major).
+    if [[ "$base" == "decode_projection_incore_0" || "$base" == "rmsnorm_incore_0" ]]; then
+      if ! grep -Fq "TRESHAPE(" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing TRESHAPE() normalization for col_major vec TMOV"
+        overall=1
+        continue
+      fi
+      if ! grep -Fq "Tile<TileType::Vec, float, 1, 16, BLayout::RowMajor" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing 1x16 RowMajor reinterpret tile after TMOV normalization"
+        overall=1
+        continue
+      fi
+    fi
+
     # Regression guard for issue #185: barrier_sync must support op types
     # beyond TMATMUL/TVEC and lower to the expected per-pipe barrier.
     if [[ "$base" == "test_barrier_sync" ]]; then
@@ -831,16 +1026,26 @@ PY
         overall=1
         continue
       fi
+      if ! grep -Fq "SaturationMode::ON" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing SaturationMode::ON lowering for pto.tcvt"
+        overall=1
+        continue
+      fi
+      if ! grep -Fq "RoundMode::CAST_TRUNC" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing CAST_TRUNC lowering for pto.tcvt"
+        overall=1
+        continue
+      fi
     fi
 
     if [[ "$base" == "fillpad_inplace" ]]; then
       if ! grep -Fq "TFILLPAD_INPLACE(" "$cpp"; then
-        echo -e "${A}(${base}.py)\tFAIL\tmissing TFILLPAD_INPLACE() lowering for aliased pto.tfillpad"
+        echo -e "${A}(${base}.py)\tFAIL\tmissing TFILLPAD_INPLACE() lowering for pto.tfillpad_inplace"
         overall=1
         continue
       fi
       if grep -Fq "TFILLPAD_EXPAND(" "$cpp"; then
-        echo -e "${A}(${base}.py)\tFAIL\tpto.tfillpad alias path should not lower via TFILLPAD_EXPAND()"
+        echo -e "${A}(${base}.py)\tFAIL\tpto.tfillpad_inplace should not lower via TFILLPAD_EXPAND()"
         overall=1
         continue
       fi
@@ -860,6 +1065,200 @@ PY
         overall=1
         continue
       fi
+    fi
+
+    if [[ "$base" == "comm_p2p" || "$base" == "comm_p2p_binding_variants" || "$base" == "comm_multicard_all_ops" ]]; then
+      for pat in \
+        "pto::comm::TPUT(" \
+        "pto::comm::TGET(" \
+        "pto::comm::TNOTIFY(" \
+        "pto::comm::TWAIT(" \
+        "pto::comm::TTEST("; do
+        if ! grep -Fq "$pat" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tmissing $pat lowering"
+          overall=1
+          continue 2
+        fi
+      done
+      if ! grep -Fq "pto::AtomicType::AtomicAdd" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing atomic-add TPUT lowering"
+        overall=1
+        continue
+      fi
+      if [[ "$base" == "comm_p2p_binding_variants" || "$base" == "comm_multicard_all_ops" ]]; then
+        for pat in \
+          "pto::comm::NotifyOp::AtomicAdd" \
+          "pto::comm::WaitCmp::GE"; do
+          if ! grep -Fq "$pat" "$cpp"; then
+            echo -e "${A}(${base}.py)\tFAIL\tmissing $pat lowering"
+            overall=1
+            continue 2
+          fi
+        done
+        if [[ "$base" != "twait_atomic_binding" ]]; then
+          for pat in \
+            "pto::comm::NotifyOp::Set" \
+            "pto::comm::WaitCmp::LE" \
+            "pto::comm::WaitCmp::EQ" \
+            "pto::comm::WaitCmp::NE"; do
+            if ! grep -Fq "$pat" "$cpp"; then
+              echo -e "${A}(${base}.py)\tFAIL\tmissing $pat lowering"
+              overall=1
+              continue 2
+            fi
+          done
+        fi
+      fi
+    fi
+
+    if [[ "$base" == "twait_atomic_binding" ]]; then
+      for pat in \
+        "__global__ AICORE void TWaitAtomicKernel(" \
+        "pto::comm::TNOTIFY(" \
+        "pto::comm::TWAIT("; do
+        if ! grep -Fq "$pat" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tmissing $pat lowering"
+          overall=1
+          continue 2
+        fi
+      done
+    fi
+
+    if [[ "$base" == "tnotify_atomic_add_binding" ]]; then
+      for pat in \
+        "__global__ AICORE void TNotifyAtomicAddKernel(" \
+        "pto::comm::TNOTIFY("; do
+        if ! grep -Fq "$pat" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tmissing $pat lowering"
+          overall=1
+          continue 2
+        fi
+      done
+    fi
+
+    if [[ "$base" == "comm_collective" || "$base" == "comm_collective_binding_variants" || "$base" == "comm_multicard_all_ops" ]]; then
+      for pat in \
+        "pto::comm::ParallelGroup" \
+        "pto::comm::TBROADCAST("; do
+        if ! grep -Fq "$pat" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tmissing $pat lowering"
+          overall=1
+          continue 2
+        fi
+      done
+      if [[ "$base" != "tbroadcast_root_binding" && "$base" != "tgather_root_binding" && "$base" != "tscatter_root_binding" && "$base" != "treduce_root_binding" ]]; then
+        for pat in \
+          "pto::comm::TGATHER(" \
+          "pto::comm::TSCATTER(" \
+          "pto::comm::TREDUCE("; do
+          if ! grep -Fq "$pat" "$cpp"; then
+            echo -e "${A}(${base}.py)\tFAIL\tmissing $pat lowering"
+            overall=1
+            continue 2
+          fi
+        done
+      fi
+      if [[ "$base" != "tbroadcast_root_binding" && "$base" != "tgather_root_binding" && "$base" != "tscatter_root_binding" && "$base" != "treduce_root_binding" ]] && (! grep -Fq "pto::comm::ReduceOp::Sum" "$cpp" || ! grep -Fq "pto::comm::ReduceOp::Max" "$cpp"); then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing reduce-op enum lowering"
+        overall=1
+        continue
+      fi
+      if [[ "$base" == "comm_collective_binding_variants" ]]; then
+        if ! grep -Fq "pto::comm::ReduceOp::Min" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tmissing reduce-op Min lowering"
+          overall=1
+          continue
+        fi
+      fi
+    fi
+
+    if [[ "$base" == "tbroadcast_root_binding" ]]; then
+      for pat in \
+        "__global__ AICORE void TBroadCastKernelImpl(" \
+        "pto::comm::TBROADCAST(" \
+        "pto::comm::ParallelGroup"; do
+        if ! grep -Fq "$pat" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tmissing $pat lowering"
+          overall=1
+          continue 2
+        fi
+      done
+    fi
+
+    if [[ "$base" == "tgather_root_binding" ]]; then
+      for pat in \
+        "__global__ AICORE void TGatherKernelImpl(" \
+        "pto::comm::TGATHER(" \
+        "pto::comm::ParallelGroup"; do
+        if ! grep -Fq "$pat" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tmissing $pat lowering"
+          overall=1
+          continue 2
+        fi
+      done
+    fi
+
+    if [[ "$base" == "tscatter_root_binding" ]]; then
+      for pat in \
+        "__global__ AICORE void TScatterKernelImpl(" \
+        "pto::comm::TSCATTER(" \
+        "pto::comm::ParallelGroup"; do
+        if ! grep -Fq "$pat" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tmissing $pat lowering"
+          overall=1
+          continue 2
+        fi
+      done
+    fi
+
+    if [[ "$base" == "treduce_root_binding" ]]; then
+      for pat in \
+        "__global__ AICORE void TReduceKernelImpl(" \
+        "pto::comm::TREDUCE(" \
+        "pto::comm::ParallelGroup" \
+        "pto::comm::ReduceOp::Sum"; do
+        if ! grep -Fq "$pat" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tmissing $pat lowering"
+          overall=1
+          continue 2
+        fi
+      done
+    fi
+
+    if [[ "$base" == "a5_comm_st_sync_flows" ]]; then
+      for pat in \
+        "pto::comm::TPUT(" \
+        "pto::comm::TGET(" \
+        "pto::comm::TNOTIFY(" \
+        "pto::comm::TWAIT(" \
+        "pto::comm::TTEST(" \
+        "pto::comm::ParallelGroup" \
+        "pto::comm::TBROADCAST(" \
+        "pto::comm::TGATHER(" \
+        "pto::comm::TSCATTER(" \
+        "pto::comm::TREDUCE(" \
+        "pto::comm::ReduceOp::Sum"; do
+        if ! grep -Fq "$pat" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tmissing $pat lowering"
+          overall=1
+          continue 2
+        fi
+      done
+    fi
+
+    if [[ "$base" == "a5_comm_st_async_flows" ]]; then
+      for pat in \
+        "pto::comm::BuildAsyncSession<" \
+        "pto::comm::TGET_ASYNC<" \
+        "pto::comm::TPUT_ASYNC<" \
+        "pto::comm::AsyncEvent" \
+        "pto::comm::AsyncSession"; do
+        if ! grep -Fq "$pat" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tmissing $pat lowering"
+          overall=1
+          continue 2
+        fi
+      done
     fi
 
 	    # Regression guard for Issue #190:
@@ -922,28 +1321,60 @@ PY
         *-pto-ir.pto) continue ;;
       esac
       base="$(basename "$f" .pto)"
+      local expect_fail=0
+      case "$base" in
+        *_invalid|*_xfail) expect_fail=1 ;;
+      esac
+      if [[ ( "$base" == "test_tmov_col_major_16x1_align_a5" || \
+              "$base" == "test_tmov_row_major_1x16_control_a5" || \
+              "$base" == "decode_projection_incore_0" || \
+              "$base" == "rmsnorm_incore_0" ) && \
+            "${target_arch_lc}" != "a5" ]]; then
+        echo -e "${A}(${base}.pto)\tSKIP\trequires --pto-arch=a5"
+        continue
+      fi
       local pto_input="$f"
       ptobc_file="${out_subdir}/${base}.ptobc"
       decoded_pto="${out_subdir}/${base}-roundtrip.pto"
       cpp="${out_subdir}/${base}.cpp"
+      if [[ "$A" == "Qwen3DecodeA3" || "$A" == "Qwen3DecodeA5" || "$A" == "DeepseekV4DecodeA3" || "$A" == "DeepseekV4DecodeA5" ]]; then
+        cpp="${out_subdir}/${base}-pto.cpp"
+      elif [[ "$base" == "tquant_mx" ]]; then
+        # Board validation currently discovers generated sample kernels via
+        # the historical `*-pto.cpp` naming convention.
+        cpp="${out_subdir}/${base}-pto.cpp"
+      fi
       local sample_use_ptobc_roundtrip="$use_ptobc_roundtrip"
 
-      # TODO(ptobc): decode of this regression currently fails with
-      # "operand value_id out of range" when scf.if returns tile-like values.
-      # Keep ptoas regression coverage here, and re-enable roundtrip once
-      # ptobc supports this pattern.
-      if [[ "$base" == "test_if_else_tile_result" ]]; then
+      # TODO(ptobc): Keep ptoas regression coverage for patterns that are not
+      # yet supported by ptobc roundtrip; re-enable once ptobc catches up.
+      if [[ "$base" == "prelu-pto" || \
+            "$base" == "gemvmx-pto" || \
+            "$base" == "matmul_mx_low_precision-pto" || \
+            "$base" == "test_if_else_tile_result" || \
+            "$base" == "test_tmov_col_major_16x1_align_a5" || \
+            "$base" == "test_tmov_row_major_1x16_control_a5" || \
+            "$base" == "decode_projection_incore_0" || \
+            "$base" == "rmsnorm_incore_0" || \
+            "$base" == "test_frontend_pipe_flag_id_overflow_invalid" ]]; then
         sample_use_ptobc_roundtrip=0
       fi
-
       if [[ $sample_use_ptobc_roundtrip -eq 1 ]]; then
         # Allow generic escape for ops that are not yet in the compact v0 opcode table.
         if ! PTOBC_ALLOW_GENERIC=1 "$ptobc" encode "$f" -o "$ptobc_file" >/dev/null 2>&1; then
+          if [[ $expect_fail -eq 1 ]]; then
+            echo -e "${A}(${base}.pto)\tXFAIL\tptobc encode failed as expected"
+            continue
+          fi
           echo -e "${A}(${base}.pto)\tFAIL\tptobc encode failed: $(basename "$f")"
           overall=1
           continue
         fi
         if ! "$ptobc" decode "$ptobc_file" -o "$decoded_pto" >/dev/null 2>&1; then
+          if [[ $expect_fail -eq 1 ]]; then
+            echo -e "${A}(${base}.pto)\tXFAIL\tptobc decode failed as expected"
+            continue
+          fi
           echo -e "${A}(${base}.pto)\tFAIL\tptobc decode failed: $(basename "$ptobc_file")"
           overall=1
           continue
@@ -952,8 +1383,25 @@ PY
       fi
 
       local -a ptoas_cmd=("${ptoas_cmd_base[@]}" "$pto_input" -o "$cpp")
-      if ! "${ptoas_cmd[@]}" >/dev/null 2>&1; then
+      local ptoas_log="${out_subdir}/${base}-ptoas.log"
+      if ! "${ptoas_cmd[@]}" >"${ptoas_log}" 2>&1; then
+        if [[ $expect_fail -eq 1 ]]; then
+          if [[ "$base" == "test_frontend_pipe_flag_id_overflow_invalid" ]]; then
+            if ! grep -Fq "fit within 16 hardware flag ids" "${ptoas_log}"; then
+              echo -e "${A}(${base}.pto)\tFAIL\texpected hardware flag budget diagnostic not found"
+              overall=1
+              continue
+            fi
+          fi
+          echo -e "${A}(${base}.pto)\tXFAIL\tptoas failed as expected"
+          continue
+        fi
         echo -e "${A}(${base}.pto)\tFAIL\tptoas failed: $(basename "$f")"
+        overall=1
+        continue
+      fi
+      if [[ $expect_fail -eq 1 ]]; then
+        echo -e "${A}(${base}.pto)\tFAIL\texpected failure but succeeded"
         overall=1
         continue
       fi

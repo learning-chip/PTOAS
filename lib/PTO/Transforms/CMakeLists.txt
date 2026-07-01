@@ -12,10 +12,42 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 add_mlir_dialect_library(PTOTransforms
+  TileFusion/FusionAnalysis.cpp
+  TileFusion/FusionOpSemantics.cpp
+  TileFusion/PTOPreFusionAnalysis.cpp
+  TileFusion/PTOPrintPreFusionAnalysis.cpp
+  TileFusion/PTOFusionPlan.cpp
+  TileFusion/PTOOpScheduling.cpp
+  TileFusion/PTOMarkLastUse.cpp
+  TileFusion/PTOFusionRegionGen.cpp
+  TileFusion/PTOLowLevelLoopFusion.cpp
+  TileFusion/PTOFusionPredicateElision.cpp
+  TileFusion/PTOFusionLoadStoreElision.cpp
+  TileFusion/PTOFlattenFusionRegion.cpp
+  VPTOLLVMEmitter.cpp
+  VPTOCANN900LLVMEmitter.cpp
+  VPTOLLVMEmitterDispatcher.cpp
+  VPTOLLVMEmitterHelper.cpp
+  VPTOPtrNormalize.cpp
+  VPTOPtrCastCleanup.cpp
+  VPTOExpandWrapperOps.cpp
+  PTOVPTOPtrBoundary.cpp
+  VPTOBufferMaterialization.cpp
+  PTOValidateVPTOIR.cpp
+  PTOUnrollSIMTForPass.cpp
+  PTOInferVPTOVecScope.cpp
+
   InsertSync/PTOInsertSync.cpp
+  PTOInjectBarrierAllSync.cpp
   InsertSync/InsertSyncDebug.cpp
   PTOViewToMemref.cpp
+  PTOValidateIntToPtrUses.cpp
+  ExpandTileOp.cpp
+  FoldTileBufIntrinsics.cpp
+  PTOLowerToOpLibCalls.cpp
+  PTOInstantiateAndInlineOpLib.cpp
   PTOToEmitC.cpp
+  CppPostprocess.cpp
   Utils.cpp
   OptMemPlanForPipeline.cpp
   AllocToPointerCast.cpp
@@ -23,12 +55,24 @@ add_mlir_dialect_library(PTOTransforms
   PTOPlanMemory.cpp
   PTORemoveRedundantBarrier.cpp
   InferPTOLayout.cpp
+  PTOA5NormalizeTMovPass.cpp
+  PTORemoveIdentityTMov.cpp
+  PTOCanonicalizeIR.cpp
+  PTOMaterializeTileHandles.cpp
   BufferizableOpInterfaceImpl.cpp
   ConvertToPTOOp.cpp
+  PTOAssignDefaultFrontendPipeIdPass.cpp
   PTOLowerFrontendPipeOpsPass.cpp
+  PTOInferValidatePipeInitPass.cpp
+  PTOResolveBufferSelect.cpp
   PTOResolveReservedBuffersPass.cpp
+  SlotAffineAnalysis.cpp
   PTOWrapFunctionsInSectionsPass.cpp
+  PTONormalizeUncoveredTileSections.cpp
+  VPTONormalizeContainer.cpp
+  VPTOSplitCVModule.cpp
   InsertSync/PTOIRTranslator.cpp
+  InsertSync/SyncMacroModel.cpp
   InsertSync/SyncCommon.cpp
   InsertSync/InsertSyncAnalysis.cpp
   InsertSync/MemoryDependentAnalyzer.cpp
@@ -36,8 +80,22 @@ add_mlir_dialect_library(PTOTransforms
   InsertSync/RemoveRedundantSync.cpp
   InsertSync/SyncEventIdAllocation.cpp
   InsertSync/SyncCodegen.cpp
+  BufidSync/BufidSyncPass.cpp
+  BufidSync/BufidSyncAnalysis.cpp
+  BufidSync/BufidSyncIdAlloc.cpp
+  BufidSync/BufidSyncCodegen.cpp
+  GraphSyncSolver/PTOGraphSyncSolver.cpp
+  GraphSyncSolver/SyncSolverIR.cpp
+  GraphSyncSolver/SyncSolverIRTranslator.cpp
+  GraphSyncSolver/Utility.cpp
+  GraphSyncSolver/MemInfo.cpp
+  GraphSyncSolver/GraphSolver.cpp
+  GraphSyncSolver/EventIdSolver.cpp
+  GraphSyncSolver/SyncSolver.cpp
+  GraphSyncSolver/SyncSolverCodeGen.cpp
   LoweringSyncToPipe.cpp
   PTOVerifyTFreePass.cpp
+  PTOVerifySubkernelPipeContractPass.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/PTO
@@ -45,6 +103,9 @@ add_mlir_dialect_library(PTOTransforms
   DEPENDS
   PTOPassesIncGen
   PTOOpsIncGen
+
+  LINK_COMPONENTS
+  Analysis
 
   LINK_LIBS PUBLIC
   PTOIR
@@ -59,7 +120,16 @@ add_mlir_dialect_library(PTOTransforms
   MLIRTransformUtils
   MLIRTransforms
   MLIRTensorDialect
+  MLIRSCFDialect
+  MLIRVectorDialect
+  MLIRParser
+  MLIRArithTransforms
   MLIRSCFToEmitC
+  MLIRSCFDialect
+  MLIRSCFToControlFlow
+  MLIRConvertToLLVMPass
+  MLIRTargetLLVMIRExport
+  MLIRToLLVMIRTranslationRegistration
 )
 
 install(TARGETS PTOTransforms

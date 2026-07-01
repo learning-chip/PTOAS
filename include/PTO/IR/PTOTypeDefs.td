@@ -13,21 +13,30 @@
 
 //===- PTOTypeDefs.td --------------------------------------------------*- tablegen -*-===//
 include "mlir/IR/AttrTypeBase.td"
+include "mlir/IR/BuiltinTypeInterfaces.td"
+include "mlir/Interfaces/DataLayoutInterfaces.td"
 include "PTO/IR/PTODialect.td"
 include "PTO/IR/PTOAttrs.td"
 
-// ---- !pto.ptr<elem> ----
+// ---- !pto.ptr<elem, gm|ub> ----
 def PtrType : TypeDef<PTO_Dialect, "Ptr"> {
   let mnemonic = "ptr";
   let parameters = (ins
-    "mlir::Type":$elementType
+    "mlir::Type":$elementType,
+    "mlir::pto::AddressSpaceAttr":$memorySpace
   );
-  let assemblyFormat = "`<` $elementType `>`";
+  let hasCustomAssemblyFormat = 1;
 
   let skipDefaultBuilders = 1;
   let builders = [
     TypeBuilder<(ins "Type":$elementType), [{
-      return Base::get($_ctxt, elementType);
+      return Base::get($_ctxt, elementType,
+                       mlir::pto::AddressSpaceAttr::get($_ctxt,
+                                                        mlir::pto::AddressSpace::GM));
+    }]>,
+    TypeBuilder<(ins "Type":$elementType,
+                     "mlir::pto::AddressSpaceAttr":$memorySpace), [{
+      return Base::get($_ctxt, elementType, memorySpace);
     }]>
   ];
 }
@@ -85,6 +94,15 @@ def PartitionTensorViewType : TypeDef<PTO_Dialect, "PartitionTensorView"> {
   );
 
   let hasCustomAssemblyFormat = 1;
+
+  // Convenience builders: explicit shape, or rank -> all dynamic ("?")
+  let builders = [
+    TypeBuilder<(ins "int64_t":$rank,
+                     "Type":$elementType), [{
+      SmallVector<int64_t, 4> shp(rank, mlir::ShapedType::kDynamic);
+      return Base::get($_ctxt, shp, elementType);
+    }]>
+  ];
 
   let extraClassDeclaration = [{
     int64_t getRank() const { return getShape().size(); }
@@ -210,6 +228,45 @@ def TileBufType : TypeDef<PTO_Dialect, "TileBuf"> {
   }];
 }
 
+// =============================================================================
+// MultiTileBufType
+// =============================================================================
+// 对应 IR: !pto.multi_tile_buf<<slotType>, count=N>
+//
+// 表达一个"由 N 个物理 slot 组成"的逻辑 tile buffer。每个 slot 与
+// `slotType` 完全同构（同 shape / dtype / loc / valid / config）。该类型只
+// 能通过 `pto.alloc_multi_tile` 产生，通过 `pto.multi_tile_get [%k]` 取出
+// 第 k 个 slot 后转回普通 `tile_buf`，下游所有 op 仍然只见到 `tile_buf`。
+// =============================================================================
+def MultiTileBufType : TypeDef<PTO_Dialect, "MultiTileBuf"> {
+  let mnemonic = "multi_tile_buf";
+  let summary = "An array of N physical slots sharing one tile_buf shape";
+  let description = [{
+    A `multi_tile_buf` value owns `count` physically-distinct slots of an
+    inner `tile_buf` shape. The slot type is identical across all N slots;
+    only the underlying physical address differs.
+
+    Multi-buffer is opaque to all existing `tile_buf` ops: extracting a slot
+    via `pto.multi_tile_get` yields a regular `tile_buf` that can be passed
+    to any DMA / compute / view op unchanged. The slot index expression is
+    user-provided (constant or any SSA `index`); ptoas does not synthesize
+    `iv mod N` for users.
+  }];
+
+  let parameters = (ins
+    "mlir::pto::TileBufType":$slotType,
+    "uint32_t":$count
+  );
+
+  let hasCustomAssemblyFormat = 1;
+  let genVerifyDecl = 1;
+
+  let extraClassDeclaration = [{
+    /// Return the inner per-slot tile_buf type.
+    mlir::pto::TileBufType getTileBufType() const { return getSlotType(); }
+  }];
+}
+
 def EventIdArrayType : TypeDef<PTO_Dialect, "EventIdArray"> {
   let mnemonic = "eventid_array";
   let summary = "Manual-only local array for dynamic event ids";
@@ -217,6 +274,33 @@ def EventIdArrayType : TypeDef<PTO_Dialect, "EventIdArray"> {
     "int64_t":$size
   );
   let assemblyFormat = "`<` $size `>`";
+}
+
+// ---- !pto.local_array<D1 x D2 x ... x Dk x T> ----
+// Statically-shaped C++ stack-local array. Lowers to a plain `T a[D1][D2]...;`
+// declaration in the emitted C++. Element type is restricted to scalars
+// (integer / float). This type does NOT participate in PTO memory planning
+// or pto.pointer_cast lowering — the underlying address is decided by the
+// host C++ compiler, not by PTOAS.
+def LocalArrayType : TypeDef<PTO_Dialect, "LocalArray"> {
+  let mnemonic = "local_array";
+  let summary = "C++ stack-local statically-sized array";
+  let parameters = (ins
+    ArrayRefParameter<"int64_t">:$shape,
+    "mlir::Type":$elementType
+  );
+
+  let hasCustomAssemblyFormat = 1;
+  let genVerifyDecl = 1;
+
+  let extraClassDeclaration = [{
+    int64_t getRank() const { return getShape().size(); }
+    int64_t getNumElements() const {
+      int64_t num = 1;
+      for (int64_t d : getShape()) num *= d;
+      return num;
+    }
+  }];
 }
 
 def PipeType : TypeDef<PTO_Dialect, "Pipe"> {
@@ -233,3 +317,64 @@ def AsyncEventType : TypeDef<PTO_Dialect, "AsyncEvent"> {
   let mnemonic = "async_event";
   let summary = "Opaque async DMA event handle type";
 }
+
+def PrefetchAsyncContextType
+    : TypeDef<PTO_Dialect, "PrefetchAsyncContext"> {
+  let mnemonic = "prefetch_async_context";
+  let summary = "Opaque PTO prefetch async context handle type";
+}
+
+// ---- !pto.hif8 ---- Corresponding type name: hifloat8_t (1 byte)
+def HiF8Type : TypeDef<PTO_Dialect, "HiF8", [
+    MemRefElementTypeInterface,
+    DeclareTypeInterfaceMethods<DataLayoutTypeInterface,
+      ["getTypeSizeInBits", "getABIAlignment", "getPreferredAlignment"]>
+]> {
+  let mnemonic = "hif8";
+  let summary = "Ascend A5 HiFloat8 (8-bit, 1 byte per element).";
+}
+
+// ---- !pto.f8E8M0 ---- Corresponding type name: float8_e8m0_t (1 byte)
+def F8E8M0Type : TypeDef<PTO_Dialect, "F8E8M0", [
+    MemRefElementTypeInterface,
+    DeclareTypeInterfaceMethods<DataLayoutTypeInterface,
+      ["getTypeSizeInBits", "getABIAlignment", "getPreferredAlignment"]>
+]> {
+  let mnemonic = "f8E8M0";
+  let summary = "Ascend A5 MX exponent/scale payload (8-bit E8M0, 1 byte per element).";
+}
+
+// ---- !pto.hif8x2 ---- Corresponding type name: hifloat8x2_t (2 bytes)
+def HiF8x2Type : TypeDef<PTO_Dialect, "HiF8x2", [
+    DeclareTypeInterfaceMethods<DataLayoutTypeInterface,
+      ["getTypeSizeInBits", "getABIAlignment", "getPreferredAlignment"]>
+]> {
+  let mnemonic = "hif8x2";
+  let summary = "Packed pair of Ascend A5 HiFloat8 values (2 bytes).";
+}
+
+// ---- !pto.f4E1M2x2 ---- Corresponding type name: float4_e1m2x2_t (1 byte = 2 FP4 packed)
+def F4E1M2x2Type : TypeDef<PTO_Dialect, "F4E1M2x2", [
+    MemRefElementTypeInterface,
+    DeclareTypeInterfaceMethods<DataLayoutTypeInterface,
+      ["getTypeSizeInBits", "getABIAlignment", "getPreferredAlignment"]>
+]> {
+  let mnemonic = "f4E1M2x2";
+  let summary =
+      "Packed pair of FP4 values (E1M2 format, 2-per-byte). "
+      "tile_buf shape counts pairs; each pair occupies 1 byte.";
+}
+
+// ---- !pto.f4E2M1x2 ---- Corresponding type name: float4_e2m1x2_t (1 byte = 2 FP4 packed)
+def F4E2M1x2Type : TypeDef<PTO_Dialect, "F4E2M1x2", [
+    MemRefElementTypeInterface,
+    DeclareTypeInterfaceMethods<DataLayoutTypeInterface,
+      ["getTypeSizeInBits", "getABIAlignment", "getPreferredAlignment"]>
+]> {
+  let mnemonic = "f4E2M1x2";
+  let summary =
+      "Packed pair of FP4 values (E2M1 format, 2-per-byte). "
+      "tile_buf shape counts pairs; each pair occupies 1 byte.";
+}
+
+include "PTO/IR/VPTOTypeDefs.td"

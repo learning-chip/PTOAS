@@ -1,9 +1,25 @@
 # pyproject.toml - Project metadata
 #
-# NOTE: This project has a complex build process that requires LLVM/MLIR to be
-# built first. The wheel is created from MLIR's python packages directory, not
-# from this repo root. See .github/workflows/build_wheel.yml for the full build
-# process.
+# Build flow (requires LLVM already built):
+#   pip install .
+#
+# This will:
+#   1. CMake configure + Ninja build + install
+#   2. Package Python bindings into a wheel via docker/create_wheel.sh
+#
+# Environment variables (all optional):
+#   LLVM_BUILD_DIR               Path to LLVM build dir
+#                                (default: /llvm-workspace/llvm-project/build-shared)
+#   PTO_BUILD_DIR                Path to PTOAS build dir (default: <repo>/build)
+#   PTO_INSTALL_DIR              Install prefix (default: <repo>/install)
+#   CMAKE_C_COMPILER             Optional C compiler passed through to CMake
+#   CMAKE_CXX_COMPILER           Optional C++ compiler passed through to CMake
+#   PTOAS_PYTHON_PACKAGE_VERSION Wheel version override
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "_ptoas_build_backend"
+backend-path = ["."]
 
 [project]
 name = "ptoas"
@@ -11,7 +27,10 @@ version = "0.1.0"
 description = "PTO Assembler & Optimizer"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+dependencies = [
+    "numpy",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

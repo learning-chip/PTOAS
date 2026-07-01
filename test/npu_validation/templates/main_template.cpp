@@ -18,11 +18,34 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include "test_common.h"
 #include "acl/acl.h"
 @RUNTIME_RT_INCLUDE@
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
 using namespace PtoTestCommon;
+
+#ifndef PTOAS_VALIDATION_LOW_PRECISION_HOST_TYPES
+#define PTOAS_VALIDATION_LOW_PRECISION_HOST_TYPES
+typedef struct {
+    unsigned char v;
+} hifloat8_t;
+typedef struct {
+    unsigned char v;
+} float8_e4m3_t;
+typedef struct {
+    unsigned char v;
+} float8_e5m2_t;
+typedef struct {
+    unsigned char v;
+} float8_e8m0_t;
+typedef struct {
+    unsigned char v;
+} float4_e1m2x2_t;
+typedef struct {
+    unsigned char v;
+} float4_e2m1x2_t;
+#endif
 
 #ifndef TMRGSORT_HPP
 namespace pto {

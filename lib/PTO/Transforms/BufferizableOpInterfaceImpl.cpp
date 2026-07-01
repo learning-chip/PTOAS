@@ -23,11 +23,43 @@ using namespace mlir::bufferization;
 
 namespace {
 
-/// Generic conversion for any DestinationStyleOpInterface on tensors.
 static LogicalResult bufferizeDestinationStyleOpInterface(
     RewriterBase &rewriter, DestinationStyleOpInterface op,
     const BufferizationOptions &options,
-    bool supportMixedTensorBufferMode = true) {
+    bool supportMixedTensorBufferMode = true);
+
+template <typename Derived, typename OpTy,
+          bool supportMixedTensorBufferMode = true>
+struct PTODpsOpInterfaceBase
+    : public DstBufferizableOpInterfaceExternalModel<Derived, OpTy> {
+  LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
+                          const BufferizationOptions &options) const {
+    return bufferizeDestinationStyleOpInterface(
+        rewriter, cast<DestinationStyleOpInterface>(op), options,
+        supportMixedTensorBufferMode);
+  }
+};
+
+template <typename Derived, typename OpTy>
+struct PTOReadWriteDpsOpInterfaceBase
+    : public PTODpsOpInterfaceBase<Derived, OpTy> {
+  bool bufferizesToMemoryRead(Operation *op, OpOperand &opOperand,
+                              const AnalysisState &state) const {
+    auto dpsOp = cast<DestinationStyleOpInterface>(op);
+    return dpsOp.isDpsInput(&opOperand);
+  }
+
+  bool bufferizesToMemoryWrite(Operation *op, OpOperand &opOperand,
+                               const AnalysisState &state) const {
+    auto dpsOp = cast<DestinationStyleOpInterface>(op);
+    return dpsOp.isDpsInit(&opOperand);
+  }
+};
+
+/// Generic conversion for any DestinationStyleOpInterface on tensors.
+static LogicalResult bufferizeDestinationStyleOpInterface(
+    RewriterBase &rewriter, DestinationStyleOpInterface op,
+    const BufferizationOptions &options, bool supportMixedTensorBufferMode) {
   // Take a guard before anything else.
   OpBuilder::InsertionGuard g(rewriter);
   rewriter.setInsertionPoint(op);
@@ -82,14 +114,7 @@ static LogicalResult bufferizeDestinationStyleOpInterface(
 }
 
 struct PTOLoadOpInterface
-    : public DstBufferizableOpInterfaceExternalModel<PTOLoadOpInterface,
-                                                     pto::TLoadOp> {
-  LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
-                          const BufferizationOptions &options) const {
-    return bufferizeDestinationStyleOpInterface(
-        rewriter, cast<DestinationStyleOpInterface>(op), options);
-  }
-};
+    : public PTODpsOpInterfaceBase<PTOLoadOpInterface, pto::TLoadOp> {};
 
 struct PTOStoreOpInterface
     : public DstBufferizableOpInterfaceExternalModel<PTOStoreOpInterface,
@@ -132,70 +157,23 @@ struct PTOStoreOpInterface
   }
 };
 
-/// TMrgSortOp format2 has dsts = [memref, vector<4xi16>]. The vector init
-/// must not participate in bufferization (not a tensor/memref).
+/// TMrgSortOp format2 keeps only the destination tile in dsts. The executed
+/// vector result remains a non-bufferizable side operand/result.
 struct PTOMrgSortDpsOpInterface
-    : public DstBufferizableOpInterfaceExternalModel<PTOMrgSortDpsOpInterface,
-                                                     pto::TMrgSortOp> {
-  LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
-                         const BufferizationOptions &options) const {
-    return bufferizeDestinationStyleOpInterface(
-        rewriter, cast<DestinationStyleOpInterface>(op), options,
-        /*supportMixedTensorBufferMode=*/true);
-  }
-};
+    : public PTODpsOpInterfaceBase<PTOMrgSortDpsOpInterface,
+                                   pto::TMrgSortOp> {};
 
 struct PTOAddOpInterface
-    : public DstBufferizableOpInterfaceExternalModel<PTOAddOpInterface,
-                                                     pto::TAddOp> {
-  bool bufferizesToMemoryRead(Operation *op, OpOperand &opOperand,
-                              const AnalysisState &state) const {
-    // Operand is read if it is used in the computation.
-    auto dpsOp = cast<DestinationStyleOpInterface>(op);
-    return dpsOp.isDpsInput(&opOperand);
-  }
-
-  bool bufferizesToMemoryWrite(Operation *op, OpOperand &opOperand,
-                               const AnalysisState &state) const {
-    // Operand is written to if it is not an input/init.
-    auto dpsOp = cast<DestinationStyleOpInterface>(op);
-    return dpsOp.isDpsInit(&opOperand);
-  }
-
+    : public PTOReadWriteDpsOpInterfaceBase<PTOAddOpInterface, pto::TAddOp> {
   bool bufferizesToElementwiseAccess(Operation *op, const AnalysisState &state,
                                      ArrayRef<OpOperand *> opOperands) const {
     return true;
   }
-
-  LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
-                          const BufferizationOptions &options) const {
-    return bufferizeDestinationStyleOpInterface(
-        rewriter, cast<DestinationStyleOpInterface>(op), options);
-  }
 };
 
 struct PTOMatmulOpInterface
-    : public DstBufferizableOpInterfaceExternalModel<PTOMatmulOpInterface,
-                                                     pto::TMatmulOp> {
-  bool bufferizesToMemoryRead(Operation *op, OpOperand &opOperand,
-                              const AnalysisState &state) const {
-    auto dpsOp = cast<DestinationStyleOpInterface>(op);
-    return dpsOp.isDpsInput(&opOperand);
-  }
-
-  bool bufferizesToMemoryWrite(Operation *op, OpOperand &opOperand,
-                               const AnalysisState &state) const {
-    auto dpsOp = cast<DestinationStyleOpInterface>(op);
-    return dpsOp.isDpsInit(&opOperand);
-  }
-
-  LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
-                          const BufferizationOptions &options) const {
-    return bufferizeDestinationStyleOpInterface(
-        rewriter, cast<DestinationStyleOpInterface>(op), options,
-        /*supportMixedTensorBufferMode=*/true);
-  }
-};
+    : public PTOReadWriteDpsOpInterfaceBase<PTOMatmulOpInterface,
+                                            pto::TMatmulOp> {};
 
 } // namespace
 

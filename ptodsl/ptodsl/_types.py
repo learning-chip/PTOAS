@@ -1,0 +1,483 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+"""
+Lazy MLIR type descriptors and eager type constructors.
+
+Type descriptors (``_DType`` subclasses) can be created *before* any MLIR
+Context exists – they only resolve to concrete ``mlir.ir.Type`` objects when
+``_resolve()`` is called inside an active context.  This lets users write::
+
+    def softmax(arg0: pto.ptr(pto.float32, "GM"), ...):
+        ...
+
+where the annotation is evaluated at *import* time (no active context), and
+the actual type is materialised later by the ``@pto.jit`` decorator.
+"""
+
+from ._bootstrap import make_context  # ensure MLIR is on sys.path
+
+from mlir.dialects import pto as _pto
+from mlir.dialects import arith
+from mlir.dialects.builtin import UnrealizedConversionCastOp
+from mlir.ir import (
+    BF16Type,
+    F16Type,
+    F32Type,
+    Float8E4M3FNType,
+    Float8E5M2Type,
+    FloatAttr,
+    IndexType,
+    IntegerType,
+    ShapedType,
+    Type,
+)
+
+# ── Address-space name → AddressSpace enum ───────────────────────────────────
+_ADDR_SPACE = {
+    "ub":  _pto.AddressSpace.VEC,  # UB == unified buffer == VEC in PTO
+    "gm":  _pto.AddressSpace.GM,
+    "vec": _pto.AddressSpace.VEC,
+    "mat": _pto.AddressSpace.MAT,
+    "left": _pto.AddressSpace.LEFT,
+    "right": _pto.AddressSpace.RIGHT,
+    "acc": _pto.AddressSpace.ACC,
+    "bias": _pto.AddressSpace.BIAS,
+    "scaling": _pto.AddressSpace.SCALING,
+    "GM":  _pto.AddressSpace.GM,
+    "UB":  _pto.AddressSpace.VEC,
+    "VEC": _pto.AddressSpace.VEC,
+    "MAT": _pto.AddressSpace.MAT,
+    "LEFT": _pto.AddressSpace.LEFT,
+    "RIGHT": _pto.AddressSpace.RIGHT,
+    "ACC": _pto.AddressSpace.ACC,
+    "BIAS": _pto.AddressSpace.BIAS,
+    "SCALING": _pto.AddressSpace.SCALING,
+}
+
+
+# ── Lazy type descriptor base ─────────────────────────────────────────────────
+
+class _DType:
+    """Deferred MLIR type: only resolves inside an active MLIR context."""
+
+    def __init__(self, factory):
+        self._factory = factory
+
+    def resolve(self) -> Type:
+        return self._factory()
+
+    def __call__(self, value):
+        target_type = self.resolve()
+        kind = _classify_scalar_type(target_type)
+        if kind == "float":
+            return arith.ConstantOp(target_type, _parse_float_attr(target_type, value)).result
+        if kind == "integer":
+            return _materialize_integer_literal(target_type, value)
+        raise TypeError(f"unsupported eager constructor target type {target_type}")
+
+    def __repr__(self):
+        return f"<pto.dtype {self._factory}>"
+
+
+class _PtrDescriptor(_DType):
+    def __init__(self, elem, space: str):
+        self._elem = elem
+        self._space = space
+
+    def resolve(self) -> Type:
+        elem = _ensure_tensor_storage_dtype(self._elem, context="pto.ptr(...)")
+        space_enum = _normalize_address_space(self._space)
+        if space_enum is None:
+            raise ValueError(
+                f"Unknown address space '{self._space}'; "
+                f"known: {list(_ADDR_SPACE)}"
+            )
+        space_attr = _pto.AddressSpaceAttr.get(space_enum)
+        try:
+            return _pto.PtrType.get(elem, memory_space=space_attr)
+        except TypeError:
+            ptr_get_impl = getattr(_pto, "_ptr_type_get_impl", None)
+            if ptr_get_impl is None:
+                raise
+            if space_enum != _pto.AddressSpace.GM:
+                raise TypeError(
+                    "The current PTO Python bindings only expose the default-GM "
+                    "PtrType builder. Non-GM pointer construction is not "
+                    "available through ptodsl._types.ptr(...) yet."
+                )
+            return ptr_get_impl(elem)
+
+    def __repr__(self):
+        return f"<pto.ptr {self._elem} {self._space}>"
+
+
+class _VRegDescriptor(_DType):
+    def __init__(self, lanes: int, elem):
+        self._lanes = lanes
+        self._elem = elem
+
+    def resolve(self) -> Type:
+        elem = _ensure_tensor_storage_dtype(self._elem, context="pto.vreg_type(...)")
+        vreg_type_cls = getattr(_pto, "VRegType", None)
+        if vreg_type_cls is None:
+            raise TypeError(
+                "The current PTO Python bindings do not expose VRegType. "
+                "Rebuild the PTO Python extension before using pto.vreg_type(...)."
+            )
+        return vreg_type_cls.get(self._lanes, elem)
+
+    def __repr__(self):
+        return f"<pto.vreg {self._lanes}x{self._elem}>"
+
+
+class _MaskDescriptor(_DType):
+    def __init__(self, bits: str):
+        self._bits = bits
+
+    def resolve(self) -> Type:
+        mask_type_cls = getattr(_pto, "MaskType", None)
+        if mask_type_cls is None:
+            raise TypeError(
+                "The current PTO Python bindings do not expose MaskType. "
+                "Rebuild the PTO Python extension before using pto.mask_type(...)."
+            )
+        return mask_type_cls.get(self._bits)
+
+    def __repr__(self):
+        return f"<pto.mask {self._bits}>"
+
+
+def _resolve(dtype) -> Type:
+    """Coerce a ``_DType`` descriptor or a concrete ``mlir.ir.Type`` to a Type."""
+    if isinstance(dtype, _DType):
+        return dtype.resolve()
+    return dtype  # already an mlir.ir.Type
+
+
+def _classify_scalar_type(type_obj):
+    if F32Type.isinstance(type_obj) or F16Type.isinstance(type_obj) or BF16Type.isinstance(type_obj):
+        return "float"
+    if IndexType.isinstance(type_obj) or IntegerType.isinstance(type_obj):
+        return "integer"
+    return None
+
+
+def _isinstance_pto_type(type_obj, type_name: str) -> bool:
+    cls = getattr(_pto, type_name, None)
+    if cls is None:
+        return False
+    try:
+        return cls.isinstance(type_obj)
+    except Exception:
+        return False
+
+
+def _classify_storage_dtype(type_obj):
+    if _classify_scalar_type(type_obj) is not None:
+        return "compute"
+    if Float8E4M3FNType.isinstance(type_obj) or Float8E5M2Type.isinstance(type_obj):
+        return "storage_only"
+    if any(_isinstance_pto_type(type_obj, name) for name in ("HiF8Type", "F4E1M2x2Type", "F4E2M1x2Type")):
+        return "storage_only"
+    return "other"
+
+
+def _is_storage_only_dtype(type_obj):
+    return _classify_storage_dtype(type_obj) == "storage_only"
+
+
+def _is_storage_only_authored_dtype(dtype) -> bool:
+    if isinstance(dtype, _DType):
+        return dtype in _STORAGE_ONLY_DTYPE_DESCRIPTORS
+    return _is_storage_only_dtype(_resolve(dtype))
+
+
+def _ensure_tensor_storage_dtype(dtype, *, context: str):
+    type_obj = _resolve(dtype)
+    category = _classify_storage_dtype(type_obj)
+    if category not in {"compute", "storage_only"}:
+        raise TypeError(f"{context} does not support element type {type_obj}")
+    return type_obj
+
+
+def _ensure_non_storage_only_dtype(dtype, *, context: str):
+    type_obj = _resolve(dtype)
+    if _is_storage_only_dtype(type_obj):
+        raise TypeError(
+            f"{context} does not accept storage-only low-precision type {type_obj}; "
+            "these dtypes are only supported in Tile / TensorView / PartitionTensorView construction"
+        )
+    return type_obj
+
+
+def _ensure_non_storage_only_authored_dtype(dtype, *, context: str):
+    if _is_storage_only_authored_dtype(dtype):
+        raise TypeError(
+            f"{context} does not accept storage-only low-precision types; "
+            "these dtypes are only supported in Tile / TensorView / PartitionTensorView construction"
+        )
+    return dtype
+
+
+def _integer_signedness(type_obj):
+    if not IntegerType.isinstance(type_obj):
+        raise TypeError(f"expected integer type, got {type_obj}")
+    text = str(type_obj)
+    if text.startswith("si"):
+        return "signed"
+    if text.startswith("ui"):
+        return "unsigned"
+    return "signless"
+
+
+def _signless_integer_type(type_obj):
+    if not IntegerType.isinstance(type_obj):
+        raise TypeError(f"expected integer type, got {type_obj}")
+    return IntegerType.get_signless(IntegerType(type_obj).width)
+
+
+def _strip_integer_signedness(value):
+    value_type = getattr(value, "type", None)
+    if value_type is None or not IntegerType.isinstance(value_type):
+        return value
+    signless_type = _signless_integer_type(value_type)
+    if value_type == signless_type:
+        return value
+    return UnrealizedConversionCastOp([signless_type], [value]).results[0]
+
+
+def _restore_integer_signedness(value, target_type):
+    if not IntegerType.isinstance(target_type):
+        raise TypeError(f"expected integer target type, got {target_type}")
+    signless_type = _signless_integer_type(target_type)
+    if target_type == signless_type:
+        return value
+    return UnrealizedConversionCastOp([target_type], [value]).results[0]
+
+
+def _materialize_integer_literal(target_type, value):
+    if not IntegerType.isinstance(target_type):
+        raise TypeError(f"unsupported eager integer constructor target type {target_type}")
+    signless_type = _signless_integer_type(target_type)
+    raw_value = _parse_integer_value(value, target_type=target_type)
+    constant = arith.ConstantOp(signless_type, raw_value).result
+    if target_type == signless_type:
+        return constant
+    return _restore_integer_signedness(constant, target_type)
+
+
+def _parse_integer_value(value, *, target_type=None):
+    if isinstance(value, bool):
+        raise TypeError("eager scalar constructors do not accept bool values")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        return _parse_integer_text(text)
+    raise TypeError(f"cannot materialize {value!r} as an integer constant of type {target_type}")
+
+
+def _parse_integer_text(text: str):
+    if text.startswith(("0x", "0X", "-0x", "-0X")):
+        return int(text, 16)
+    return int(text, 0)
+
+
+def _parse_float_attr(target_type, value):
+    if isinstance(value, bool):
+        raise TypeError("eager scalar constructors do not accept bool values")
+    if isinstance(value, str):
+        text = value.strip()
+        lower = text.lower()
+        if lower in {"inf", "+inf", "-inf", "nan"}:
+            numeric = float(lower)
+        elif text.startswith(("0x", "0X")):
+            return _float_attr_from_bit_pattern(target_type, text)
+        else:
+            numeric = float(text)
+    else:
+        numeric = float(value)
+    return FloatAttr.get(target_type, numeric)
+
+
+def _float_attr_from_bit_pattern(target_type, text):
+    import math
+    import struct
+
+    if F16Type.isinstance(target_type):
+        bits = int(text, 16) & 0xFFFF
+        as_bytes = bits.to_bytes(2, byteorder="little", signed=False)
+        numeric = struct.unpack("<e", as_bytes)[0]
+        if math.isnan(numeric):
+            numeric = float("nan")
+        return FloatAttr.get(target_type, numeric)
+    if BF16Type.isinstance(target_type):
+        bits = int(text, 16) & 0xFFFF
+        as_bytes = bits.to_bytes(2, byteorder="little", signed=False) + b"\x00\x00"
+        numeric = struct.unpack("<f", as_bytes)[0]
+        if math.isnan(numeric):
+            numeric = float("nan")
+        return FloatAttr.get(target_type, numeric)
+    if F32Type.isinstance(target_type):
+        bits = int(text, 16) & 0xFFFFFFFF
+        as_bytes = bits.to_bytes(4, byteorder="little", signed=False)
+        numeric = struct.unpack("<f", as_bytes)[0]
+        if math.isnan(numeric):
+            numeric = float("nan")
+        return FloatAttr.get(target_type, numeric)
+    raise TypeError(f"bit-pattern float literals are not supported for {target_type}")
+
+
+def _normalize_address_space(space):
+    if isinstance(space, str):
+        return _ADDR_SPACE.get(space)
+    if isinstance(space, _pto.AddressSpace):
+        return space
+    return None
+
+
+def _int_descriptor(width: int, signedness: str):
+    if signedness == "signless":
+        return _DType(lambda: IntegerType.get_signless(width))
+    if signedness == "signed":
+        return _DType(lambda: IntegerType.get_signed(width))
+    if signedness == "unsigned":
+        return _DType(lambda: IntegerType.get_unsigned(width))
+    raise ValueError(f"unsupported integer signedness {signedness!r}")
+
+
+# ── Scalar dtype singletons ───────────────────────────────────────────────────
+
+float32 = _DType(F32Type.get)
+float16 = _DType(F16Type.get)
+bf16    = _DType(BF16Type.get)
+f8e4m3  = _DType(Float8E4M3FNType.get)
+f8e5m2  = _DType(Float8E5M2Type.get)
+hif8    = _DType(lambda: _pto.HiF8Type.get())
+f4e1m2x2 = _DType(lambda: _pto.F4E1M2x2Type.get())
+f4e2m1x2 = _DType(lambda: _pto.F4E2M1x2Type.get())
+_STORAGE_ONLY_DTYPE_DESCRIPTORS = (
+    f8e4m3,
+    f8e5m2,
+    hif8,
+    f4e1m2x2,
+    f4e2m1x2,
+)
+int1    = _int_descriptor(1, "signless")
+int8    = _int_descriptor(8, "signless")
+int16   = _int_descriptor(16, "signless")
+int32   = _int_descriptor(32, "signless")
+int64   = _int_descriptor(64, "signless")
+si8     = _int_descriptor(8, "signed")
+si16    = _int_descriptor(16, "signed")
+si32    = _int_descriptor(32, "signed")
+si64    = _int_descriptor(64, "signed")
+ui8     = _int_descriptor(8, "unsigned")
+ui16    = _int_descriptor(16, "unsigned")
+ui32    = _int_descriptor(32, "unsigned")
+ui64    = _int_descriptor(64, "unsigned")
+index   = _DType(IndexType.get)
+
+
+# ── Type constructor functions ────────────────────────────────────────────────
+
+def ptr(elem, space: str = "ub") -> _PtrDescriptor:
+    """Return a lazy descriptor for ``!pto.ptr<elem, space>``."""
+    return _PtrDescriptor(elem, space)
+
+
+def vreg_type(lanes: int, elem) -> _VRegDescriptor:
+    """Return a lazy descriptor for ``!pto.vreg<lanesxelem>``."""
+    return _VRegDescriptor(lanes, elem)
+
+
+def mask_type(bits: str = "b32") -> _MaskDescriptor:
+    """Return a lazy descriptor for ``!pto.mask<bits>``."""
+    return _MaskDescriptor(bits)
+
+
+def tile_buf_type(shape, dtype, valid_shape=None, *,
+                  blayout: str = "RowMajor",
+                  address_space: str = "ub",
+                  slayout: str = "NoneBox",
+                  fractal_size: int = 512,
+                  pad: str = "Null") -> Type:
+    """
+    Construct a ``!pto.tile_buf<…>`` type via the Python bindings.
+
+    ``valid_shape`` entries may be ``-1`` for dynamic (``?``) dimensions.
+    When ``valid_shape`` is omitted, construct a tile type without a ``valid=``
+    suffix and let the type's logical shape stand on its own.
+    ``blayout="ColMajor"`` prints as ``blayout=col_major``.
+
+    Requires an active MLIR context.
+    """
+    elem = _ensure_tensor_storage_dtype(dtype, context="pto.tile_buf_type(...)")
+    space_enum = _normalize_address_space(address_space)
+    if space_enum is None:
+        raise ValueError(
+            f"Unknown address_space '{address_space}'; known: {list(_ADDR_SPACE)}"
+        )
+    space_attr = _pto.AddressSpaceAttr.get(space_enum)
+    cfg = _pto.TileBufConfigAttr.get(
+        _pto.BLayoutAttr.get(getattr(_pto.BLayout, blayout)),
+        _pto.SLayoutAttr.get(getattr(_pto.SLayout, slayout)),
+        fractal_size,
+        _pto.PadValueAttr.get(getattr(_pto.PadValue, pad)),
+    )
+    if valid_shape is None and cfg is None:
+        return _pto.TileBufType.get(shape, elem, space_attr)
+    if valid_shape is None:
+        return _pto.TileBufType.get(shape, elem, space_attr, config=cfg)
+    if cfg is None:
+        return _pto.TileBufType.get(shape, elem, space_attr, valid_shape=valid_shape)
+    return _pto.TileBufType.get(shape, elem, space_attr, valid_shape=valid_shape, config=cfg)
+
+
+def tensor_view_type(rank: int, elem) -> Type:
+    """``!pto.tensor_view<?x…xelem>`` with *rank* all-dynamic dims."""
+    return _pto.TensorViewType.get(rank, _ensure_tensor_storage_dtype(elem, context="pto.tensor_view_type(...)"))
+
+
+def tensor_view_type_from_dims(dims, elem) -> Type:
+    """``!pto.tensor_view<d0x…xdN x elem>`` when every dimension is static."""
+    resolved_elem = _ensure_tensor_storage_dtype(elem, context="pto.tensor_view_type_from_dims(...)")
+    if all(isinstance(dim, int) for dim in dims):
+        return _pto.TensorViewType.get(list(dims), resolved_elem)
+    return tensor_view_type(len(dims), resolved_elem)
+
+
+def part_tensor_view_type(rank: int, elem) -> Type:
+    """``!pto.partition_tensor_view<?x…xelem>`` with *rank* all-dynamic dims."""
+    kDynamic = ShapedType.get_dynamic_size()
+    return _pto.PartitionTensorViewType.get(
+        [kDynamic] * rank,
+        _ensure_tensor_storage_dtype(elem, context="pto.part_tensor_view_type(...)"),
+    )
+
+
+def part_tensor_view_type_from_dims(dims, elem) -> Type:
+    """``!pto.partition_tensor_view<d0x…xdN x elem>`` when every dimension is static."""
+    resolved_elem = _ensure_tensor_storage_dtype(elem, context="pto.part_tensor_view_type_from_dims(...)")
+    if all(isinstance(dim, int) for dim in dims):
+        return _pto.PartitionTensorViewType.get(list(dims), resolved_elem)
+    return part_tensor_view_type(len(dims), resolved_elem)
+
+
+__all__ = [
+    "_DType", "_resolve",
+    "float32", "float16", "bf16",
+    "f8e4m3", "f8e5m2", "hif8", "f4e1m2x2", "f4e2m1x2",
+    "int1", "int8", "int16", "int32", "int64",
+    "si8", "si16", "si32", "si64",
+    "ui8", "ui16", "ui32", "ui64",
+    "index",
+    "ptr", "vreg_type", "mask_type",
+    "tile_buf_type", "tensor_view_type", "tensor_view_type_from_dims",
+    "part_tensor_view_type", "part_tensor_view_type_from_dims",
+]

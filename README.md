@@ -16,7 +16,7 @@
 ## 2. 目录结构 (Directory Structure)
 
 ```text
-pto-as/
+PTOAS/
 ├── include/
 │   └── PTO/               # PTO Dialect 的头文件与 TableGen 定义 (.td)
 ├── lib/
@@ -46,15 +46,15 @@ pto-as/
 
 ```bash
 # ================= 配置区域 (请修改这里) =================
-# 设置您的工作根目录 (建议创建一个专门的目录存放 LLVM 和 ptoas)
+# 设置您的工作根目录 (建议创建一个专门的目录存放 LLVM 和 PTOAS)
 export WORKSPACE_DIR=$HOME/llvm-workspace
 
 # LLVM 源码与构建路径
 export LLVM_SOURCE_DIR=$WORKSPACE_DIR/llvm-project
 export LLVM_BUILD_DIR=$LLVM_SOURCE_DIR/build-shared
 
-# pto-as 源码与安装路径
-export PTO_SOURCE_DIR=$WORKSPACE_DIR/pto-as
+# PTOAS 源码与安装路径
+export PTO_SOURCE_DIR=$WORKSPACE_DIR/PTOAS
 export PTO_INSTALL_DIR=$PTO_SOURCE_DIR/install
 # =======================================================
 
@@ -71,9 +71,13 @@ mkdir -p $WORKSPACE_DIR
 * **Python**: 3.8+
 * **Python Packages**: `pybind11`, `numpy`
 ```bash
-pip3 install pybind11 numpy
+python3 -m pip install pybind11==2.12.0 numpy
 
 ```
+
+> 说明：当前 LLVM/MLIR Python 绑定与 `pybind11` 3.x 不兼容。
+> 如果编译 LLVM 时遇到 `def_property family does not currently support keep_alive` 等报错，
+> 请先执行上面的降级命令。
 
 
 
@@ -104,14 +108,14 @@ ninja -C $LLVM_BUILD_DIR
 
 ```
 
-### 3.3 第二步：构建 ptoas (Out-of-Tree)
+### 3.3 第二步：构建 PTOAS (Out-of-Tree)
 
-下载 ptoas 源码并基于刚刚编译好的 LLVM 19 进行构建。
+下载 PTOAS 源码并基于刚刚编译好的 LLVM 19 进行构建。
 
 ```bash
-# 1. 下载 ptoas 源码
+# 1. 下载 PTOAS 源码
 cd $WORKSPACE_DIR
-git clone https://gitcode.com/cann/pto-as.git
+git clone https://gitcode.com/cann/pto-as.git PTOAS
 cd $PTO_SOURCE_DIR
 
 # 2. 获取 pybind11 的 CMake 路径
@@ -145,16 +149,12 @@ $PTO_SOURCE_DIR/build/python/
 │       ├── pto.py
 │       └── _pto_ops_gen.py
 
-# install 输出（Python 方言文件）
+# install 输出（Python 方言文件和原生扩展）
 $PTO_INSTALL_DIR/
 └── mlir
-    └── dialects
-        ├── pto.py
-        └── _pto_ops_gen.py
-
-# 安装到 MLIR Python 包中的原生扩展
-$LLVM_BUILD_DIR/tools/mlir/python_packages/mlir_core/
-└── mlir
+    ├── dialects
+    │   ├── pto.py
+    │   └── _pto_ops_gen.py
     └── _mlir_libs
         └── _pto.cpython-*.so
 
@@ -177,7 +177,7 @@ $PTO_SOURCE_DIR/build/tools/ptobc/ptobc
 #    这样在 python 中 import mlir.dialects.pto 时能正确找到
 export MLIR_PYTHON_ROOT=$LLVM_BUILD_DIR/tools/mlir/python_packages/mlir_core
 export PTO_PYTHON_ROOT=$PTO_INSTALL_DIR/
-export PYTHONPATH=$MLIR_PYTHON_ROOT:$PTO_PYTHON_ROOT:$PYTHONPATH
+export PYTHONPATH=$PTO_PYTHON_ROOT:$MLIR_PYTHON_ROOT:$PYTHONPATH
 
 # 2. Library Path: 确保能加载 LLVM 和 PTO 的动态库
 export LD_LIBRARY_PATH=$LLVM_BUILD_DIR/lib:$PTO_INSTALL_DIR/lib:$LD_LIBRARY_PATH
@@ -195,16 +195,16 @@ export PATH=$PTO_SOURCE_DIR/build/tools/ptoas:$PTO_SOURCE_DIR/build/tools/ptobc:
 
 ```bash
 # 解析并打印 PTO IR
-ptoas test/basic/empty_func.pto
+ptoas test/lit/pto/empty_func.pto
 
 # 运行 AutoSyncInsert Pass
-ptoas test/basic/empty_func.pto --enable-insert-sync -o outputfile.cpp
+ptoas test/lit/pto/empty_func.pto --enable-insert-sync -o outputfile.cpp
 
 # 指定目标硬件架构（A3 / A5）
-ptoas test/basic/empty_func.pto --pto-arch=a5 -o outputfile.cpp
+ptoas test/lit/pto/empty_func.pto --pto-arch=a5 -o outputfile.cpp
 
 # 指定构建 Level（level3 会禁用 PlanMemory/InsertSync）
-ptoas test/basic/empty_func.pto --pto-level=level3 -o outputfile.cpp
+ptoas test/lit/pto/empty_func.pto --pto-level=level3 -o outputfile.cpp
 
 # 查看当前 ptoas release 版本号
 ptoas --version

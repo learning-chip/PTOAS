@@ -22,6 +22,8 @@
 
 #include "llvm/ADT/TypeSwitch.h"
 
+#include <tuple>
+
 #define DEBUG_TYPE "PTO-infer-mem-scope"
 #define LDBG(X) LLVM_DEBUG(llvm::dbgs() << X << "\n")
 
@@ -33,83 +35,101 @@ namespace mlir {
 using namespace mlir;
 using namespace pto;
 
+namespace {
+static std::optional<memref::AllocOp> requireRootAlloc(Operation *op, Value value,
+                                                       StringRef valueName) {
+  auto alloc = tracebackMemRefToAlloc(value);
+  if (!alloc.has_value())
+    emitError(op->getLoc()) << "Cannot find root memref.alloc for " << valueName
+                            << " of this op.";
+  return alloc;
+}
+
+static LogicalResult propagateAllocScope(Operation *op, Value value,
+                                         StringRef valueName,
+                                         const AddressSpaceAttr &targetScope,
+                                         MemScopeInferAndPropagateHelper &helper) {
+  auto alloc = requireRootAlloc(op, value, valueName);
+  if (!alloc.has_value())
+    return failure();
+  if (failed(helper.Run(*alloc, targetScope)))
+    return op->emitOpError()
+           << "Failed to infer/propagate memory scope for " << valueName;
+  return success();
+}
+
+static bool hasMemRefResults(Operation *op) {
+  return llvm::any_of(op->getResults(), [](OpResult result) {
+    return isa<MemRefType>(result.getType());
+  });
+}
+
+static LogicalResult propagateYieldScope(MemScopeInferAndPropagateHelper &helper,
+                                         Value val,
+                                         const AddressSpaceAttr &memrefScope,
+                                         OpOperand &user) {
+  auto op = cast<scf::YieldOp>(user.getOwner());
+  Operation *parentOp = op->getParentOp();
+  auto yieldResult = op.getOperand(user.getOperandNumber());
+  auto parentResult = parentOp->getResult(user.getOperandNumber());
+  auto yieldType = dyn_cast<BaseMemRefType>(yieldResult.getType());
+  auto valType = dyn_cast<BaseMemRefType>(val.getType());
+  if (!yieldType || !valType ||
+      yieldType.getElementType() != valType.getElementType()) {
+    return success();
+  }
+  return helper.Run(parentResult, memrefScope);
+}
+
+static LogicalResult propagateForScope(MemScopeInferAndPropagateHelper &helper,
+                                       const AddressSpaceAttr &memrefScope,
+                                       OpOperand &user) {
+  auto op = cast<scf::ForOp>(user.getOwner());
+  auto result = op.getTiedLoopResult(&user);
+  auto bbArg = op.getTiedLoopRegionIterArg(&user);
+  return success(helper.Run(bbArg, memrefScope).succeeded() &&
+                 helper.Run(result, memrefScope).succeeded());
+}
+
+static LogicalResult
+propagateViewLikeScope(MemScopeInferAndPropagateHelper &helper,
+                       const AddressSpaceAttr &memrefScope, Operation *op) {
+  auto result = op->getResult(0);
+  return helper.Run(result, memrefScope);
+}
+
+static LogicalResult
+propagateMemScopeToUser(MemScopeInferAndPropagateHelper &helper, Value val,
+                        const AddressSpaceAttr &memrefScope, OpOperand &user) {
+  Operation *owner = user.getOwner();
+  return TypeSwitch<Operation *, LogicalResult>(owner)
+      .Case<scf::YieldOp>([&](scf::YieldOp) {
+        return propagateYieldScope(helper, val, memrefScope, user);
+      })
+      .Case<scf::ForOp>([&](scf::ForOp) {
+        return propagateForScope(helper, memrefScope, user);
+      })
+      .Case<memref::SubViewOp, memref::ViewOp, memref::ReinterpretCastOp,
+            memref::CastOp, memref::CollapseShapeOp, memref::ExpandShapeOp,
+            memref::ReshapeOp, memref::TransposeOp,
+            memref::ExtractStridedMetadataOp>([&](auto op) {
+        return propagateViewLikeScope(helper, memrefScope, op);
+      })
+      .Case<func::CallOp, gpu::LaunchFuncOp>([&](auto) { return success(); })
+      .Default([&](Operation *op) {
+        if (op->getNumResults() == 0 || !hasMemRefResults(op))
+          return success();
+        op->emitOpError("Unsupported user for root alloc op.");
+        return failure();
+      });
+}
+} // namespace
+
 LogicalResult
 MemScopeInferAndPropagateHelper::propagateMemScopeToUsers(Value val) {
-  // Get new memory scope from result.
   auto memrefScope = getPTOAddressSpaceAttr(val.getType());
-  // This function propagates the type change of an SSA result to the operation
-  // that uses it. The result type of the updated operation might be affected,
-  // so we need to cascade the change.
-  auto propagateFn = [&](OpOperand &user) -> LogicalResult {
-    Operation *userDefiningOp = user.getOwner();
-    return TypeSwitch<Operation *, LogicalResult>(userDefiningOp)
-        .Case<scf::YieldOp>([&](scf::YieldOp op) {
-          Operation *parentOp = op->getParentOp();
-          auto yieldResult = op.getOperand(user.getOperandNumber());
-          auto parentResult = parentOp->getResult(user.getOperandNumber());
-
-          Type yieldType = yieldResult.getType();
-          Type valType = val.getType();
-          if (!isa<BaseMemRefType>(yieldType))
-            return success();
-          if (!isa<BaseMemRefType>(valType))
-            return success();
-          auto mtype = dyn_cast<BaseMemRefType>(yieldType);
-          auto vtype = dyn_cast<BaseMemRefType>(valType);
-          if (mtype.getElementType() != vtype.getElementType())
-            return success();
-          setBaseMemRefTypeScope(parentResult, memrefScope);
-          if (failed(propagateMemScopeToUsers(parentResult))) {
-            return failure();
-          }
-          return success();
-        })
-        .Case<scf::ForOp>([&](scf::ForOp op) {
-          auto result = op.getTiedLoopResult(&user);
-          setBaseMemRefTypeScope(result, memrefScope);
-          auto bbArg = op.getTiedLoopRegionIterArg(&user);
-          setBaseMemRefTypeScope(bbArg, memrefScope);
-          return success(propagateMemScopeToUsers(bbArg).succeeded() &&
-                         propagateMemScopeToUsers(result).succeeded());
-        })
-        .Case<memref::SubViewOp, memref::ViewOp, memref::ReinterpretCastOp,
-              memref::CastOp, memref::CollapseShapeOp, memref::ExpandShapeOp,
-              memref::ReshapeOp, memref::TransposeOp,
-              memref::ExtractStridedMetadataOp>([&](auto op) {
-          auto result = op->getResult(0);
-          setBaseMemRefTypeScope(result, memrefScope);
-          return propagateMemScopeToUsers(result);
-        })
-        .Case<func::CallOp>([&](auto op) {
-          // For function calls, we cannot propagate the memory scope because
-          // we don't know the relationship between the inputs and results.
-          // But we don't need to report failure because we can run propagation
-          // for the results.
-          return success();
-        })
-        .Case<gpu::LaunchFuncOp>([&](auto op) {
-          // Same as above
-          return success();
-        })
-        .Default([&](Operation *op) {
-          // Don't need to update Ops that don't have results.
-          if (op->getNumResults() == 0) {
-            return success();
-          }
-          // Or results that are not memrefs.
-          if (llvm::none_of(op->getResults(), [&](OpResult result) {
-                return isa<MemRefType>(result.getType());
-              })) {
-            return success();
-          }
-          op->emitOpError("Unsupported user for root alloc op.");
-          return failure();
-        });
-  };
-  // Iterate over the users of the val.
   for (OpOperand &user : val.getUses()) {
-    // Update the type of the result that corresponds to the operand.
-    if (failed(propagateFn(user))) {
+    if (failed(propagateMemScopeToUser(*this, val, memrefScope, user))) {
       return failure();
     }
   }
@@ -146,285 +166,114 @@ struct InferPTOMemScopePass
 
 private:
   LogicalResult fixDeviceCallSite(func::FuncOp op);
-  LogicalResult fixHostFuncSignature(func::FuncOp op);
+  [[maybe_unused]] LogicalResult fixHostFuncSignature(func::FuncOp op);
 };
 } // namespace
 
-LogicalResult pto::inferAndPropagateMemScopeForMovDps(pto::TMovOp op) {
-  // 替换 hasPureBufferSemantics()
-  // 在 PTO 的语义中，如果 Op 没有返回值 (Result)，就意味着它是 Buffer 语义（操作的是 TileBuf 或 MemRef）
+template <typename OpT>
+static LogicalResult ensureDpsOnlyOp(OpT op) {
   if (op.getNumResults() != 0) {
-    return op->emitOpError("Run infer memory scope after bufferization (Op must have 0 results).");
+    return op->emitOpError(
+        "Run infer memory scope after bufferization (Op must have 0 results).");
   }
+  return success();
+}
 
-  Value mA = op.getSrc();
-  Value mB = op.getDst();
+static AddressSpaceAttr getMemScopeAttr(MLIRContext *ctx,
+                                        pto::AddressSpace scope) {
+  return AddressSpaceAttr::get(ctx, scope);
+}
 
-  // 直接使用 Value，不需要再调 ->get()
-  // mA, mB, mC 现在已经是 Value 类型了
-  auto allocA = tracebackMemRefToAlloc(mA);
-  auto allocB = tracebackMemRefToAlloc(mB);
+static LogicalResult propagateOperandScopes(
+    Operation *op,
+    ArrayRef<std::tuple<Value, StringRef, AddressSpaceAttr>> specs) {
+  MemScopeInferAndPropagateHelper helper;
+  for (const auto &[value, valueName, targetScope] : specs) {
+    if (failed(propagateAllocScope(op, value, valueName, targetScope, helper)))
+      return failure();
+  }
+  return success();
+}
 
-  if (!allocA.has_value()) {
-    emitError(op.getLoc()) << "Cannot find root memref.alloc for mA of this op.";
+LogicalResult pto::inferAndPropagateMemScopeForMovDps(pto::TMovOp op) {
+  if (failed(ensureDpsOnlyOp(op)))
     return failure();
-  }
-  if (!allocB.has_value()) {
-    emitError(op.getLoc()) << "Cannot find root memref.alloc for mB of this op.";
+
+  auto dstAlloc = requireRootAlloc(op, op.getDst(), "mB");
+  if (!dstAlloc.has_value())
     return failure();
-  }
-  auto memRefType = dyn_cast<BaseMemRefType>(allocB.value().getType());
-  if (!memRefType) {
+
+  auto memRefType = dyn_cast<BaseMemRefType>(dstAlloc->getType());
+  if (!memRefType)
     return op->emitOpError("Failed to infer/propagate memory scope for mA");
-  }
 
   auto memSpace = memRefType.getMemorySpace();
-  if (!memSpace) {
+  if (!memSpace)
     return success();
-  }
 
-  auto l0aSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::LEFT);
-  auto l0bSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::RIGHT);
-  auto l0cSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::ACC);
-  auto l1SpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::MAT);
-  auto ubSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::VEC);
-  auto biasSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::BIAS);
-
-  MemScopeInferAndPropagateHelper helper;
-
-  if (memSpace == ubSpaceAttr) {
-    // For MmadL1Op, operand mA should be in L1.
-    if (failed(helper.Run(*allocA, ubSpaceAttr))) {
-      return op->emitOpError("Failed to infer/propagate memory scope for mA");
-    }
-    return success();
-  }
-
-  if (memSpace == l1SpaceAttr) {
-    // For MmadL1Op, operand mA should be in L1.
-    if (failed(helper.Run(*allocA, l0cSpaceAttr))) {
-      return op->emitOpError("Failed to infer/propagate memory scope for mA");
-    }
-    return success();
-  }
-
-  if (memSpace == l0aSpaceAttr ||
-      memSpace == l0bSpaceAttr ||
+  auto l0aSpaceAttr =
+      getMemScopeAttr(op->getContext(), pto::AddressSpace::LEFT);
+  auto l0bSpaceAttr =
+      getMemScopeAttr(op->getContext(), pto::AddressSpace::RIGHT);
+  auto l0cSpaceAttr =
+      getMemScopeAttr(op->getContext(), pto::AddressSpace::ACC);
+  auto l1SpaceAttr = getMemScopeAttr(op->getContext(), pto::AddressSpace::MAT);
+  auto ubSpaceAttr = getMemScopeAttr(op->getContext(), pto::AddressSpace::VEC);
+  auto biasSpaceAttr =
+      getMemScopeAttr(op->getContext(), pto::AddressSpace::BIAS);
+  if (memSpace == ubSpaceAttr)
+    return propagateOperandScopes(op, {{op.getSrc(), "mA", ubSpaceAttr}});
+  if (memSpace == l1SpaceAttr)
+    return propagateOperandScopes(op, {{op.getSrc(), "mA", l0cSpaceAttr}});
+  if (memSpace == l0aSpaceAttr || memSpace == l0bSpaceAttr ||
       memSpace == biasSpaceAttr) {
-    // For MmadL1Op, operand mA should be in L1.
-    if (failed(helper.Run(*allocA, l1SpaceAttr))) {
-      return op->emitOpError("Failed to infer/propagate memory scope for mA");
-    }
-    return success();
+    return propagateOperandScopes(op, {{op.getSrc(), "mA", l1SpaceAttr}});
   }
-
   return success();
 }
 
 LogicalResult pto::inferAndPropagateMemScopeForMatmulAccDps(pto::TMatmulAccOp op) {
-  // 替换 hasPureBufferSemantics()
-  // 在 PTO 的语义中，如果 Op 没有返回值 (Result)，就意味着它是 Buffer 语义（操作的是 TileBuf 或 MemRef）
-  if (op.getNumResults() != 0) {
-    return op->emitOpError("Run infer memory scope after bufferization (Op must have 0 results).");
-  }
-
-  // 替换 getDpsInputOperand/getDpsInitOperand
-  // 直接使用 ODS 生成的命名函数，更直观且安全
-  // 原逻辑: Input(0)->LHS, Input(1)->RHS, Init(0)->DST
-  Value mAcc = op.getAccIn();
-  Value mA = op.getLhs();
-  Value mB = op.getRhs();
-  Value mC = op.getDst();
-
-  // 直接使用 Value，不需要再调 ->get()
-  // mA, mB, mC 现在已经是 Value 类型了
-  auto allocAcc = tracebackMemRefToAlloc(mAcc);
-  auto allocA = tracebackMemRefToAlloc(mA);
-  auto allocB = tracebackMemRefToAlloc(mB);
-  auto allocC = tracebackMemRefToAlloc(mC);
-  
-
-  if (!allocAcc.has_value()) {
-    emitError(op.getLoc()) << "Cannot find root memref.alloc for mAcc of this op.";
+  if (failed(ensureDpsOnlyOp(op)))
     return failure();
-  }
-  if (!allocA.has_value()) {
-    emitError(op.getLoc()) << "Cannot find root memref.alloc for mA of this op.";
-    return failure();
-  }
-  if (!allocB.has_value()) {
-    emitError(op.getLoc()) << "Cannot find root memref.alloc for mB of this op.";
-    return failure();
-  }
-  if (!allocC.has_value()) {
-    emitError(op.getLoc()) << "Cannot find root memref.alloc for mC of this op.";
-    return failure();
-  }
 
-  auto l0aSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::LEFT);
-  auto l0bSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::RIGHT);
-  auto l0cSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::ACC);
-
-  MemScopeInferAndPropagateHelper helper;
-
-   // For MmadL1Op, operand mA should be in L1.
-  if (failed(helper.Run(*allocAcc, l0cSpaceAttr))) {
-    return op->emitOpError("Failed to infer/propagate memory scope for mAcc");
-  }
-
-  // For MmadL1Op, operand mA should be in L1.
-  if (failed(helper.Run(*allocA, l0aSpaceAttr))) {
-    return op->emitOpError("Failed to infer/propagate memory scope for mA");
-  }
-  LDBG("IR after setting mem scope for mA:\n" << *(op->getParentOfType<ModuleOp>()));
-
-  // For MmadL1Op, operand mB should be in L1.
-  if (failed(helper.Run(*allocB, l0bSpaceAttr))) {
-    return op->emitOpError("Failed to infer/propagate memory scope for mB");
-  }
-  LDBG("IR after setting mem scope for mB:\n" << *(op->getParentOfType<ModuleOp>()));
-
-  // For MmadL1Op, operand mC should be in L0C.
-  if (failed(helper.Run(*allocC, l0cSpaceAttr))) {
-    return op->emitOpError("Failed to infer/propagate memory scope for mC");
-  }
-  LDBG("IR after setting mem scope for mC:\n" << *(op->getParentOfType<ModuleOp>()));
-
-  return success();
+  return propagateOperandScopes(
+      op, {{op.getAccIn(), "mAcc",
+            getMemScopeAttr(op->getContext(), pto::AddressSpace::ACC)},
+           {op.getLhs(), "mA",
+            getMemScopeAttr(op->getContext(), pto::AddressSpace::LEFT)},
+           {op.getRhs(), "mB",
+            getMemScopeAttr(op->getContext(), pto::AddressSpace::RIGHT)},
+           {op.getDst(), "mC",
+            getMemScopeAttr(op->getContext(), pto::AddressSpace::ACC)}});
 }
 
 
 LogicalResult pto::inferAndPropagateMemScopeForMatmulBiasDps(pto::TMatmulBiasOp op) {
-  // 替换 hasPureBufferSemantics()
-  // 在 PTO 的语义中，如果 Op 没有返回值 (Result)，就意味着它是 Buffer 语义（操作的是 TileBuf 或 MemRef）
-  if (op.getNumResults() != 0) {
-    return op->emitOpError("Run infer memory scope after bufferization (Op must have 0 results).");
-  }
-
-  // 替换 getDpsInputOperand/getDpsInitOperand
-  // 直接使用 ODS 生成的命名函数，更直观且安全
-  // 原逻辑: Input(0)->LHS, Input(1)->RHS, Init(0)->DST
-  Value mA = op.getA();
-  Value mB = op.getB();
-  Value mC = op.getDst(); 
-  Value mD = op.getBias(); 
-
-  // 直接使用 Value，不需要再调 ->get()
-  // mA, mB, mC 现在已经是 Value 类型了
-  auto allocA = tracebackMemRefToAlloc(mA);
-  auto allocB = tracebackMemRefToAlloc(mB);
-  auto allocC = tracebackMemRefToAlloc(mC);
-  auto allocD = tracebackMemRefToAlloc(mD);
-
-  if (!allocA.has_value()) {
-    emitError(op.getLoc()) << "Cannot find root memref.alloc for mA of this op.";
+  if (failed(ensureDpsOnlyOp(op)))
     return failure();
-  }
-  if (!allocB.has_value()) {
-    emitError(op.getLoc()) << "Cannot find root memref.alloc for mB of this op.";
-    return failure();
-  }
-  if (!allocC.has_value()) {
-    emitError(op.getLoc()) << "Cannot find root memref.alloc for mC of this op.";
-    return failure();
-  }
-  if (!allocD.has_value()) {
-    emitError(op.getLoc()) << "Cannot find root memref.alloc for mD of this op.";
-    return failure();
-  }
 
-  auto l0aSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::LEFT);
-  auto l0bSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::RIGHT);
-  auto l0cSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::ACC);
-  auto l0dSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::BIAS);
-
-  MemScopeInferAndPropagateHelper helper;
-
-  // For MmadL1Op, operand mA should be in L1.
-  if (failed(helper.Run(*allocA, l0aSpaceAttr))) {
-    return op->emitOpError("Failed to infer/propagate memory scope for mA");
-  }
-  LDBG("IR after setting mem scope for mA:\n" << *(op->getParentOfType<ModuleOp>()));
-
-  // For MmadL1Op, operand mB should be in L1.
-  if (failed(helper.Run(*allocB, l0bSpaceAttr))) {
-    return op->emitOpError("Failed to infer/propagate memory scope for mB");
-  }
-  LDBG("IR after setting mem scope for mB:\n" << *(op->getParentOfType<ModuleOp>()));
-
-  // For MmadL1Op, operand mC should be in L0C.
-  if (failed(helper.Run(*allocC, l0cSpaceAttr))) {
-    return op->emitOpError("Failed to infer/propagate memory scope for mC");
-  }
-  LDBG("IR after setting mem scope for mC:\n" << *(op->getParentOfType<ModuleOp>()));
-
-  // For MmadL1Op, operand mD should be in BIAS.
-  if (failed(helper.Run(*allocD, l0dSpaceAttr))) {
-    return op->emitOpError("Failed to infer/propagate memory scope for mC");
-  }
-  LDBG("IR after setting mem scope for mC:\n" << *(op->getParentOfType<ModuleOp>()));
-
-  return success();
+  return propagateOperandScopes(
+      op, {{op.getA(), "mA",
+            getMemScopeAttr(op->getContext(), pto::AddressSpace::LEFT)},
+           {op.getB(), "mB",
+            getMemScopeAttr(op->getContext(), pto::AddressSpace::RIGHT)},
+           {op.getDst(), "mC",
+            getMemScopeAttr(op->getContext(), pto::AddressSpace::ACC)},
+           {op.getBias(), "mD",
+            getMemScopeAttr(op->getContext(), pto::AddressSpace::BIAS)}});
 }
 
 LogicalResult pto::inferAndPropagateMemScopeForMatmulDps(pto::TMatmulOp op) {
-  // 替换 hasPureBufferSemantics()
-  // 在 PTO 的语义中，如果 Op 没有返回值 (Result)，就意味着它是 Buffer 语义（操作的是 TileBuf 或 MemRef）
-  if (op.getNumResults() != 0) {
-    return op->emitOpError("Run infer memory scope after bufferization (Op must have 0 results).");
-  }
-
-  // 替换 getDpsInputOperand/getDpsInitOperand
-  // 直接使用 ODS 生成的命名函数，更直观且安全
-  // 原逻辑: Input(0)->LHS, Input(1)->RHS, Init(0)->DST
-  Value mA = op.getLhs();
-  Value mB = op.getRhs();
-  Value mC = op.getDst(); 
-
-  // 直接使用 Value，不需要再调 ->get()
-  // mA, mB, mC 现在已经是 Value 类型了
-  auto allocA = tracebackMemRefToAlloc(mA);
-  auto allocB = tracebackMemRefToAlloc(mB);
-  auto allocC = tracebackMemRefToAlloc(mC);
-
-  if (!allocA.has_value()) {
-    emitError(op.getLoc()) << "Cannot find root memref.alloc for mA of this op.";
+  if (failed(ensureDpsOnlyOp(op)))
     return failure();
-  }
-  if (!allocB.has_value()) {
-    emitError(op.getLoc()) << "Cannot find root memref.alloc for mB of this op.";
-    return failure();
-  }
-  if (!allocC.has_value()) {
-    emitError(op.getLoc()) << "Cannot find root memref.alloc for mC of this op.";
-    return failure();
-  }
 
-  auto l0aSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::LEFT);
-  auto l0bSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::RIGHT);
-  auto l0cSpaceAttr = AddressSpaceAttr::get(op->getContext(), pto::AddressSpace::ACC);
-
-  MemScopeInferAndPropagateHelper helper;
-
-  // For MmadL1Op, operand mA should be in L1.
-  if (failed(helper.Run(*allocA, l0aSpaceAttr))) {
-    return op->emitOpError("Failed to infer/propagate memory scope for mA");
-  }
-  LDBG("IR after setting mem scope for mA:\n" << *(op->getParentOfType<ModuleOp>()));
-
-  // For MmadL1Op, operand mB should be in L1.
-  if (failed(helper.Run(*allocB, l0bSpaceAttr))) {
-    return op->emitOpError("Failed to infer/propagate memory scope for mB");
-  }
-  LDBG("IR after setting mem scope for mB:\n" << *(op->getParentOfType<ModuleOp>()));
-
-  // For MmadL1Op, operand mC should be in L0C.
-  if (failed(helper.Run(*allocC, l0cSpaceAttr))) {
-    return op->emitOpError("Failed to infer/propagate memory scope for mC");
-  }
-  LDBG("IR after setting mem scope for mC:\n" << *(op->getParentOfType<ModuleOp>()));
-
-  return success();
+  return propagateOperandScopes(
+      op, {{op.getLhs(), "mA",
+            getMemScopeAttr(op->getContext(), pto::AddressSpace::LEFT)},
+           {op.getRhs(), "mB",
+            getMemScopeAttr(op->getContext(), pto::AddressSpace::RIGHT)},
+           {op.getDst(), "mC",
+            getMemScopeAttr(op->getContext(), pto::AddressSpace::ACC)}});
 }
 
 LogicalResult InferPTOMemScopePass::fixDeviceCallSite(func::FuncOp op) {
@@ -471,12 +320,11 @@ LogicalResult InferPTOMemScopePass::fixDeviceCallSite(func::FuncOp op) {
 }
 
 /// Update the function type for the host function.
-///
 /// Because we propagate information from the call site to the caller, we only
 /// updated the memref type of the BlockArgument of or the return operation
 /// within the function (if they are updated at all). So we need to use those
 /// information to update the function's type.
-LogicalResult InferPTOMemScopePass::fixHostFuncSignature(func::FuncOp op) {
+[[maybe_unused]] LogicalResult InferPTOMemScopePass::fixHostFuncSignature(func::FuncOp op) {
   // Skip external host functions because we know nothing about it.
   if (op.isExternal())
     return success();
@@ -577,7 +425,8 @@ LogicalResult pto::inferAndPropagateMemScopeForGpuFunc(gpu::GPUFuncOp op) {
       continue;
     }
 
-    // TODO: handle case when ub arguments are passed in the GPUFuncOp
+    // GPUFuncOp arguments are currently treated as GM unless a caller-provided
+    // scope overrides them.
     if (failed(helper.Run(arg, gmSpaceAttr))) {
       return op->emitOpError()
              << "Failed to propagate memory scope for argument #"
@@ -610,16 +459,9 @@ LogicalResult pto::inferAndPropagateUbufMemScope(memref::AllocOp op) {
 }
 
 void InferPTOMemScopePass::runOnOperation() {
-  llvm::errs() << "Hello PTO Infer Mem Scope!\n";
-  auto op = getOperation();
-  op->dump();
-
   SmallVector<func::FuncOp> deviceFuncList;
-  SetVector<StringRef> deviceFuncNames;
-  SmallVector<func::FuncOp> hostFuncList;
   getOperation()->walk([&](func::FuncOp func) {
     deviceFuncList.push_back(func);
-    deviceFuncNames.insert(func.getSymName());
     return;
   });
 
@@ -673,15 +515,6 @@ void InferPTOMemScopePass::runOnOperation() {
     if (failed(fixDeviceCallSite(func)))
       signalPassFailure();
   }
-
-  for (auto func : hostFuncList) {
-    if (failed(fixHostFuncSignature(func)))
-      signalPassFailure();
-  }
-
-  llvm::errs() << "end PTO Infer Mem Scope!\n";
-  op = getOperation();
-  op->dump();
 }
 
 std::unique_ptr<Pass> mlir::pto::createInferPTOMemScopePass() {

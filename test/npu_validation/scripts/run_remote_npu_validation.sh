@@ -14,7 +14,7 @@ RUN_MODE="${RUN_MODE:-npu}"   # npu|sim
 SOC_VERSION="${SOC_VERSION:-Ascend910}"
 GOLDEN_MODE="${GOLDEN_MODE:-npu}"  # sim|npu|skip
 PTO_ISA_REPO="${PTO_ISA_REPO:-https://gitcode.com/cann/pto-isa.git}"
-PTO_ISA_COMMIT="${PTO_ISA_COMMIT:-}"
+PTO_ISA_COMMIT="${PTO_ISA_COMMIT:-7e879c4198939b506571f8769326b5a61e88da25}"
 DEVICE_ID="${DEVICE_ID:-0}"
 SKIP_CASES="${SKIP_CASES:-}"          # comma/space separated testcase names
 RUN_ONLY_CASES="${RUN_ONLY_CASES:-}"  # comma/space separated testcase names
@@ -30,6 +30,189 @@ else
 fi
 
 log() { echo "[$(date +'%F %T')] $*"; }
+
+append_unique_colon_item() {
+  local list="$1"
+  local item="$2"
+  [[ -n "${item}" && -d "${item}" ]] || {
+    echo "${list}"
+    return 0
+  }
+  if [[ -z "${list}" ]]; then
+    echo "${item}"
+    return 0
+  fi
+  case ":${list}:" in
+    *":${item}:"*) echo "${list}" ;;
+    *) echo "${list}:${item}" ;;
+  esac
+}
+
+list_contains_file() {
+  local list="$1"
+  local file_name="$2"
+  local dir
+  IFS=':' read -r -a _pto_list_dirs <<< "${list}"
+  for dir in "${_pto_list_dirs[@]}"; do
+    [[ -n "${dir}" && -e "${dir}/${file_name}" ]] && return 0
+  done
+  return 1
+}
+
+host_lib_arch() {
+  case "$(uname -m)" in
+    aarch64 | arm64) echo "aarch64" ;;
+    x86_64 | amd64) echo "x86_64" ;;
+    *) uname -m ;;
+  esac
+}
+
+collect_cann_host_link_dirs_for_root() {
+  local root="$1"
+  local arch="$2"
+  local dirs="$3"
+  local dir=""
+  for dir in \
+    "${root}/lib64" \
+    "${root}/${arch}-linux/lib64" \
+    "${root}/runtime/lib64" \
+    "${root}/fwkacllib/lib64" \
+    "${root}/${arch}-linux/devlib" \
+    "${root}/${arch}-linux/devlib/linux/${arch}"; do
+    [[ -d "${dir}" ]] || continue
+    if [[ -e "${dir}/libnnopbase.so" || -e "${dir}/libascendcl.so" \
+       || -e "${dir}/libplatform.so" || -e "${dir}/libtiling_api.a" \
+       || -e "${dir}/libtiling_api.so" ]]; then
+      dirs="$(append_unique_colon_item "${dirs}" "${dir}")"
+    fi
+  done
+  echo "${dirs}"
+}
+
+discover_cann_host_link_dirs() {
+  local arch="$1"
+  local dirs=""
+  local root=""
+  local current_base=""
+  local -a candidate_roots=()
+  shopt -s nullglob
+
+  if [[ -n "${ASCEND_HOME_PATH:-}" ]]; then
+    dirs="$(collect_cann_host_link_dirs_for_root "${ASCEND_HOME_PATH}" "${arch}" "${dirs}")"
+    current_base="$(basename "${ASCEND_HOME_PATH}")"
+  fi
+  if list_contains_file "${dirs}" "libnnopbase.so"; then
+    shopt -u nullglob
+    echo "${dirs}"
+    return 0
+  fi
+
+  if [[ -n "${ASCEND_HOME_PATH:-}" ]]; then
+    log "ASCEND_HOME_PATH=${ASCEND_HOME_PATH} is missing libnnopbase.so under standard host lib dirs; probing fallback CANN roots." >&2
+  fi
+
+  for root in \
+    /usr/local/Ascend/cann \
+    /usr/local/Ascend/cann-* \
+    /usr/local/Ascend/ascend-toolkit/latest \
+    /home/*/cann*/cann-* \
+    /home/*/*/cann-* \
+    /home/*/Ascend/*/cann-*; do
+    [[ -d "${root}" ]] || continue
+    [[ -n "${current_base}" && "${root}" == "${ASCEND_HOME_PATH:-}" ]] && continue
+    if [[ -n "${current_base}" && "${root}" == *"/${current_base}" ]]; then
+      candidate_roots+=("${root}")
+    fi
+  done
+  for root in \
+    /usr/local/Ascend/cann \
+    /usr/local/Ascend/cann-* \
+    /usr/local/Ascend/ascend-toolkit/latest \
+    /home/*/cann*/cann-* \
+    /home/*/*/cann-* \
+    /home/*/Ascend/*/cann-*; do
+    [[ -d "${root}" ]] || continue
+    [[ "${root}" == "${ASCEND_HOME_PATH:-}" ]] && continue
+    candidate_roots+=("${root}")
+  done
+  shopt -u nullglob
+
+  for root in "${candidate_roots[@]}"; do
+    dirs="$(collect_cann_host_link_dirs_for_root "${root}" "${arch}" "${dirs}")"
+    if list_contains_file "${dirs}" "libnnopbase.so"; then
+      break
+    fi
+  done
+  echo "${dirs}"
+}
+
+collect_cann_host_include_dirs_for_root() {
+  local root="$1"
+  local arch="$2"
+  local dirs="$3"
+  local dir=""
+  for dir in \
+    "${root}/include" \
+    "${root}/${arch}-linux/include" \
+    "${root}/runtime/include" \
+    "${root}/fwkacllib/include" \
+    "${root}/${arch}-linux/pkg_inc" \
+    "${root}/pkg_inc"; do
+    [[ -d "${dir}" ]] || continue
+    if [[ -e "${dir}/pto/npu/comm/async/sdma/sdma_workspace_manager.hpp" \
+       || -e "${dir}/ccelib/common/runtime.h" \
+       || -e "${dir}/runtime/rt.h" \
+       || -e "${dir}/acl/acl.h" ]]; then
+      dirs="$(append_unique_colon_item "${dirs}" "${dir}")"
+    fi
+  done
+  echo "${dirs}"
+}
+
+discover_cann_host_include_dirs() {
+  local arch="$1"
+  local dirs=""
+  local root=""
+  local current_base=""
+  local -a candidate_roots=()
+  shopt -s nullglob
+
+  if [[ -n "${ASCEND_HOME_PATH:-}" ]]; then
+    dirs="$(collect_cann_host_include_dirs_for_root "${ASCEND_HOME_PATH}" "${arch}" "${dirs}")"
+    current_base="$(basename "${ASCEND_HOME_PATH}")"
+  fi
+
+  for root in \
+    /usr/local/Ascend/cann \
+    /usr/local/Ascend/cann-* \
+    /usr/local/Ascend/ascend-toolkit/latest \
+    /home/*/cann*/cann-* \
+    /home/*/*/cann-* \
+    /home/*/Ascend/*/cann-*; do
+    [[ -d "${root}" ]] || continue
+    [[ -n "${current_base}" && "${root}" == "${ASCEND_HOME_PATH:-}" ]] && continue
+    if [[ -n "${current_base}" && "${root}" == *"/${current_base}" ]]; then
+      candidate_roots+=("${root}")
+    fi
+  done
+  for root in \
+    /usr/local/Ascend/cann \
+    /usr/local/Ascend/cann-* \
+    /usr/local/Ascend/ascend-toolkit/latest \
+    /home/*/cann*/cann-* \
+    /home/*/*/cann-* \
+    /home/*/Ascend/*/cann-*; do
+    [[ -d "${root}" ]] || continue
+    [[ "${root}" == "${ASCEND_HOME_PATH:-}" ]] && continue
+    candidate_roots+=("${root}")
+  done
+  shopt -u nullglob
+
+  for root in "${candidate_roots[@]}"; do
+    dirs="$(collect_cann_host_include_dirs_for_root "${root}" "${arch}" "${dirs}")"
+  done
+  echo "${dirs}"
+}
 
 log "=== Remote NPU Validation ==="
 log "STAGE=${STAGE} RUN_MODE=${RUN_MODE} SOC_VERSION=${SOC_VERSION}"
@@ -138,50 +321,103 @@ if ! command -v bisheng >/dev/null 2>&1; then
   fi
 fi
 
-export LD_LIBRARY_PATH="${ASCEND_HOME_PATH}/lib64:${LD_LIBRARY_PATH:-}"
+PTO_CANN_EXTRA_LINK_DIRS="$(discover_cann_host_link_dirs "$(host_lib_arch)")"
+PTO_CANN_EXTRA_INCLUDE_DIRS="$(discover_cann_host_include_dirs "$(host_lib_arch)")"
+if [[ -n "${PTO_CANN_EXTRA_LINK_DIRS}" ]]; then
+  export PTO_CANN_EXTRA_LINK_DIRS
+  export LIBRARY_PATH="${ASCEND_HOME_PATH}/lib64${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+  export LIBRARY_PATH="${LIBRARY_PATH}:${PTO_CANN_EXTRA_LINK_DIRS}"
+  export LD_LIBRARY_PATH="${ASCEND_HOME_PATH}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${PTO_CANN_EXTRA_LINK_DIRS}"
+  log "PTO_CANN_EXTRA_LINK_DIRS=${PTO_CANN_EXTRA_LINK_DIRS}"
+else
+  export LIBRARY_PATH="${ASCEND_HOME_PATH}/lib64${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+  export LD_LIBRARY_PATH="${ASCEND_HOME_PATH}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  log "WARN: no usable CANN host link dirs detected; falling back to ${ASCEND_HOME_PATH}/lib64"
+fi
+if [[ -n "${PTO_CANN_EXTRA_INCLUDE_DIRS}" ]]; then
+  export PTO_CANN_EXTRA_INCLUDE_DIRS
+  export CPATH="${PTO_CANN_EXTRA_INCLUDE_DIRS}${CPATH:+:${CPATH}}"
+  export CPLUS_INCLUDE_PATH="${PTO_CANN_EXTRA_INCLUDE_DIRS}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+  log "PTO_CANN_EXTRA_INCLUDE_DIRS=${PTO_CANN_EXTRA_INCLUDE_DIRS}"
+fi
 
 # Some CANN installs do not provide a simulator directory named exactly
 # "Ascend910". Map it to a real directory so we can link/run camodel.
-SIM_SOC_VERSION="${SOC_VERSION}"
-if [[ "${SOC_VERSION}" == "Ascend910" ]]; then
-  if [[ -d "${ASCEND_HOME_PATH}/aarch64-linux/simulator/Ascend910A/lib" ]]; then
+SIM_SOC_VERSION="${SIM_SOC_VERSION_OVERRIDE:-${SOC_VERSION}}"
+if [[ "${SIM_SOC_VERSION}" == "Ascend910" ]]; then
+  if [[ -d "${ASCEND_HOME_PATH}/aarch64-linux/simulator/Ascend910A/lib" \
+     || -d "${ASCEND_HOME_PATH}/x86_64-linux/simulator/Ascend910A/lib" \
+     || -d "${ASCEND_HOME_PATH}/simulator/Ascend910A/lib" \
+     || -d "${ASCEND_HOME_PATH}/tools/simulator/Ascend910A/lib" ]]; then
     SIM_SOC_VERSION="Ascend910A"
-  elif [[ -d "${ASCEND_HOME_PATH}/aarch64-linux/simulator/Ascend910ProA/lib" ]]; then
+  elif [[ -d "${ASCEND_HOME_PATH}/aarch64-linux/simulator/Ascend910ProA/lib" \
+       || -d "${ASCEND_HOME_PATH}/x86_64-linux/simulator/Ascend910ProA/lib" \
+       || -d "${ASCEND_HOME_PATH}/simulator/Ascend910ProA/lib" \
+       || -d "${ASCEND_HOME_PATH}/tools/simulator/Ascend910ProA/lib" ]]; then
     SIM_SOC_VERSION="Ascend910ProA"
   fi
 fi
 
-# Detect A3 (Ascend910B) board for golden-script gating.
+# Detect A3 (Ascend910A/910B) target for golden-script gating.
 # This is separate from SOC_VERSION/SIM_SOC_VERSION used for compilation
-# to avoid changing the compiler arch (dav-c220 vs dav-c310).
+# to avoid changing the compiler arch (dav-c220 vs dav-c310). Simulator runs
+# must key off the selected SIM target, not the mere presence of 910 sim libs.
 export PTOAS_BOARD_IS_A3=0
-if [[ "$(printf '%s' "${_board_chip}" | tr '[:upper:]' '[:lower:]')" == *910b* ]]; then
-  export PTOAS_BOARD_IS_A3=1
-  log "Detected A3 board from npu-smi chip name: ${_board_chip}"
-fi
-for _sim_dir in "${ASCEND_HOME_PATH}/aarch64-linux/simulator" \
-                "${ASCEND_HOME_PATH}/simulator" \
-                "${ASCEND_HOME_PATH}/tools/simulator"; do
-  for _d in "${_sim_dir}"/Ascend910B*/lib; do
-    if [[ -d "$_d" ]]; then
+if [[ "${RUN_MODE}" == "sim" ]]; then
+  sim_soc_lc="$(printf '%s' "${SIM_SOC_VERSION}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${sim_soc_lc}" == *910a* || "${sim_soc_lc}" == *910proa* || "${sim_soc_lc}" == *910b* ]]; then
+    export PTOAS_BOARD_IS_A3=1
+    log "Detected A3 target from SIM_SOC_VERSION=${SIM_SOC_VERSION}"
+  fi
+else
+  board_chip_lc="$(printf '%s' "${_board_chip}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${board_chip_lc}" == *910a* || "${board_chip_lc}" == *910proa* || "${board_chip_lc}" == *910b* ]]; then
+    export PTOAS_BOARD_IS_A3=1
+    log "Detected A3 board from npu-smi chip name: ${_board_chip}"
+  elif [[ -z "${_board_chip}" ]]; then
+    sim_soc_lc="$(printf '%s' "${SIM_SOC_VERSION}" | tr '[:upper:]' '[:lower:]')"
+    if [[ "${sim_soc_lc}" == *910a* || "${sim_soc_lc}" == *910proa* || "${sim_soc_lc}" == *910b* ]]; then
       export PTOAS_BOARD_IS_A3=1
-      log "Detected A3 board (Ascend910B) from simulator dir: $_d"
-      break 2
+      log "Detected A3 board from SIM_SOC_VERSION=${SIM_SOC_VERSION}"
     fi
-  done
-done
+  fi
+fi
 log "SIM_SOC_VERSION=${SIM_SOC_VERSION}"
+log "PTOAS_BOARD_IS_A3=${PTOAS_BOARD_IS_A3}"
+
+# Export runtime knobs consumed by generated testcase main.cpp.
+# CI/runtime commonly launches the built testcase directly instead of the
+# generated run.sh wrapper, so shell-local variables are not visible via
+# getenv() unless exported here.
+export RUN_MODE
+export SOC_VERSION="${SIM_SOC_VERSION}"
+board_chip_lc="$(printf '%s' "${_board_chip}" | tr '[:upper:]' '[:lower:]')"
+export PTOAS_BOARD_IS_A5=0
+if [[ "${board_chip_lc}" == *950* || "${board_chip_lc}" == *a5* \
+   || "${SOC_VERSION,,}" == *950* || "${SOC_VERSION,,}" == *a5* ]]; then
+  export PTOAS_BOARD_IS_A5=1
+fi
+log "PTOAS_BOARD_IS_A5=${PTOAS_BOARD_IS_A5}"
+if [[ "${PTOAS_BOARD_IS_A3}" == "1" ]]; then
+  export PTO_DISABLE_SDMA_WORKSPACE_INIT=1
+  log "Export PTO_DISABLE_SDMA_WORKSPACE_INIT=1 for A3 TPREFETCH_ASYNC runtime fallback"
+elif [[ "${PTOAS_BOARD_IS_A5}" == "1" ]]; then
+  export PTO_DISABLE_SDMA_WORKSPACE_INIT=1
+  log "Export PTO_DISABLE_SDMA_WORKSPACE_INIT=1 for A5 TPREFETCH_ASYNC runtime fallback"
+fi
 
 LD_LIBRARY_PATH_NPU="${LD_LIBRARY_PATH}"
 LD_LIBRARY_PATH_SIM="${LD_LIBRARY_PATH}"
 for d in \
   "${ASCEND_HOME_PATH}/aarch64-linux/simulator/${SIM_SOC_VERSION}/lib" \
+  "${ASCEND_HOME_PATH}/x86_64-linux/simulator/${SIM_SOC_VERSION}/lib" \
   "${ASCEND_HOME_PATH}/simulator/${SIM_SOC_VERSION}/lib" \
   "${ASCEND_HOME_PATH}/tools/simulator/${SIM_SOC_VERSION}/lib"; do
   [[ -d "$d" ]] && LD_LIBRARY_PATH_SIM="$d:${LD_LIBRARY_PATH_SIM}"
 done
 
-if [[ "${STAGE}" == "run" ]]; then
+if [[ "${STAGE}" == "run" && "${RUN_MODE}" == "npu" ]]; then
   log "=== NPU Device Check ==="
   id || true
   ls -l /dev/davinci* 2>/dev/null || true
@@ -215,6 +451,15 @@ else
   fi
 fi
 
+pto_isa_has_symbol() {
+  local symbol="$1"
+  [[ -n "${symbol}" ]] || return 1
+  find "${PTO_ISA_ROOT}/include" "${PTO_ISA_ROOT}/tests" \
+    -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' -o -name '*.cc' \) \
+    -print0 2>/dev/null \
+    | xargs -0 grep -F -q "${symbol}"
+}
+
 status=0
 ok_count=0
 fail_count=0
@@ -242,6 +487,17 @@ while IFS= read -r -d '' cpp; do
     continue
   fi
 
+  # TPREFETCH_ASYNC depends on SDMA workspace runtime support. Non-A5 board
+  # validation images can fail inside the workspace query path before the
+  # sample kernel runs, so keep it out of non-A5 runtime sweeps while still
+  # allowing build coverage and A5 runtime validation.
+  if [[ "${STAGE}" == "run" && "${testcase}" == "tprefetch_async_binding" && "${PTOAS_BOARD_IS_A5:-0}" != "1" ]]; then
+    skip_count=$((skip_count + 1))
+    printf "%s\tSKIP\t%s\trequires A5 SDMA workspace runtime support\n" "${testcase}" "${STAGE}" >> "${RESULTS_TSV}"
+    log "SKIP: ${testcase} (requires A5 SDMA workspace runtime)"
+    continue
+  fi
+
   if [[ -n "${RUN_ONLY_CASES_NORM}" ]] && ! list_contains "${RUN_ONLY_CASES_NORM}" "${testcase}"; then
     continue
   fi
@@ -249,6 +505,12 @@ while IFS= read -r -d '' cpp; do
     skip_count=$((skip_count + 1))
     printf "%s\tSKIP\t%s\tlisted in SKIP_CASES\n" "${testcase}" "${STAGE}" >> "${RESULTS_TSV}"
     log "SKIP: ${testcase} (SKIP_CASES)"
+    continue
+  fi
+  if [[ "${testcase}" == "partarg" ]] && ! pto_isa_has_symbol "TPARTARGMAX("; then
+    skip_count=$((skip_count + 1))
+    printf "%s\tSKIP\t%s\tpto-isa missing TPARTARGMAX/TPARTARGMIN\n" "${testcase}" "${STAGE}" >> "${RESULTS_TSV}"
+    log "SKIP: ${testcase} (pto-isa missing TPARTARG intrinsics)"
     continue
   fi
   if [[ "${testcase}" == "gemvmx" ]]; then

@@ -17,6 +17,30 @@
 
 namespace ptobc::v0 {
 
+inline constexpr uint8_t kVariantDefault = 0;
+inline constexpr uint8_t kVariantAcc = 1;
+inline constexpr uint8_t kVariantBias = 2;
+inline constexpr uint8_t kVariantMx = 3;
+inline constexpr uint8_t kVariantMxAcc = 4;
+inline constexpr uint8_t kVariantMxBias = 5;
+inline constexpr uint8_t kSectionCubeVariant = 0;
+inline constexpr uint8_t kSectionVectorVariant = 1;
+inline constexpr uint8_t kHasVariant = 1;
+inline constexpr uint16_t kTscatterMaskOpcode = 0x109C;
+
+inline constexpr int kTgemvOperandCount = 3;
+inline constexpr int kTgemvAccOperandCount = 4;
+inline constexpr int kTgemvBiasOperandCount = 4;
+inline constexpr int kTgemvMxOperandCount = 5;
+inline constexpr int kTgemvMxAccOperandCount = 6;
+inline constexpr int kTgemvMxBiasOperandCount = 6;
+inline constexpr int kTmatmulOperandCount = 3;
+inline constexpr int kTmatmulAccOperandCount = 4;
+inline constexpr int kTmatmulBiasOperandCount = 4;
+inline constexpr int kTmatmulMxOperandCount = 5;
+inline constexpr int kTmatmulMxAccOperandCount = 6;
+inline constexpr int kTmatmulMxBiasOperandCount = 6;
+
 struct OpInfo {
   uint16_t opcode;
   const char *name;
@@ -111,8 +135,8 @@ inline constexpr OpInfo kOpTable[] = {
   {0x1047, "pto.tquant", 0, 0x00, 0x02, 3, 0, 0, 0x00},
   {0x1048, "pto.trecip", 0, 0x00, 0x00, 2, 0, 0, 0x00},
   {0x1049, "pto.trelu", 0, 0x00, 0x00, 2, 0, 0, 0x00},
-  {0x104A, "pto.trem", 0, 0x00, 0x00, 3, 0, 0, 0x00},
-  {0x104B, "pto.trems", 0, 0x00, 0x00, 3, 0, 0, 0x00},
+  {0x104A, "pto.trem", 0, 0x00, 0x00, 4, 0, 0, 0x00},
+  {0x104B, "pto.trems", 0, 0x00, 0x00, 4, 0, 0, 0x00},
   {0x104C, "pto.treshape", 0, 0x01, 0x00, 1, 1, 0, 0x00},
   {0x104D, "pto.trowexpand", 0, 0x00, 0x00, 2, 0, 0, 0x00},
   {0x104E, "pto.trowexpandadd", 0, 0x00, 0x00, 3, 0, 0, 0x00},
@@ -139,21 +163,63 @@ inline constexpr OpInfo kOpTable[] = {
   {0x1063, "pto.tsort32", 0, 0x00, 0x02, 0, 0, 0, 0x00},
   {0x1064, "pto.tsqrt", 0, 0x00, 0x00, 2, 0, 0, 0x00},
   {0x1065, "pto.tstore", 0, 0x00, 0x02, 0, 0, 0, 0x00},
-  {0x1066, "pto.tstore.fp", 0, 0x00, 0x00, 3, 0, 0, 0x00},
+  {0x1066, "pto.tstore_fp", 0, 0x00, 0x00, 3, 0, 0, 0x00},
   {0x1067, "pto.tsub", 0, 0x00, 0x00, 3, 0, 0, 0x00},
   {0x1068, "pto.tsubc", 0, 0x00, 0x00, 4, 0, 0, 0x00},
   {0x1069, "pto.tsubs", 0, 0x00, 0x00, 3, 0, 0, 0x00},
   {0x106A, "pto.tsubsc", 0, 0x00, 0x00, 4, 0, 0, 0x00},
   {0x106B, "pto.trowexpandsub", 0, 0x00, 0x02, 0, 0, 0, 0x00},
   {0x106C, "pto.ttrans", 0, 0x00, 0x00, 3, 0, 0, 0x00},
-  {0x106D, "pto.ttri", 0, 0x00, 0x00, 3, 0, 0, 0x00},
+  {0x106D, "pto.ttri", 0, 0x00, 0x00, 2, 0, 0, 0x00},
   {0x106E, "pto.txor", 0, 0x00, 0x00, 4, 0, 0, 0x00},
   {0x106F, "pto.txors", 0, 0x00, 0x00, 4, 0, 0, 0x00},
   {0x1070, "pto.wait_event", 0, 0x00, 0x00, 0, 0, 0, 0x02},
   {0x1071, "pto.tprint", 0, 0x00, 0x00, 1, 0, 0, 0x00},
-  {0x1072, "pto.subset", 0, 0x01, 0x02, 0, 1, 0, 0x00},
+  {0x1072, "pto.subview", 0, 0x01, 0x02, 0, 1, 0, 0x00},
   {0x1073, "pto.trowexpanddiv", 0, 0x00, 0x02, 0, 0, 0, 0x00},
   {0x1074, "pto.trowexpandmul", 0, 0x00, 0x02, 0, 0, 0, 0x00},
+  {0x1075, "pto.tdequant", 0, 0x00, 0x00, 4, 0, 0, 0x00},
+  {0x1076, "pto.taxpy", 0, 0x00, 0x00, 3, 0, 0, 0x00},
+  {0x1077, "pto.thistogram", 0, 0x00, 0x00, 3, 0, 0, 0x00},
+  {0x1078, "pto.tget_scale_addr", 0, 0x00, 0x00, 2, 0, 0, 0x00},
+  {0x1079, "pto.trowargmax", 0, 0x00, 0x00, 3, 0, 0, 0x00},
+  {0x107A, "pto.trowargmin", 0, 0x00, 0x00, 3, 0, 0, 0x00},
+  {0x107B, "pto.tcolargmax", 0, 0x00, 0x00, 3, 0, 0, 0x00},
+  {0x107C, "pto.tcolargmin", 0, 0x00, 0x00, 3, 0, 0, 0x00},
+  {0x107D, "pto.tsync", 0, 0x00, 0x02, 0, 0, 0, 0x00},
+  {0x107E, "pto.reserve_buffer", 0, 0x01, 0x00, 0, 1, 0, 0x00},
+  {0x107F, "pto.import_reserved_buffer", 0, 0x01, 0x00, 0, 1, 0, 0x00},
+  {0x1080, "pto.aic_initialize_pipe", 0, 0x00, 0x02, 0, 0, 0, 0x00},
+  {0x1081, "pto.aiv_initialize_pipe", 0, 0x00, 0x02, 0, 0, 0, 0x00},
+  {0x1082, "pto.tpush_to_aiv", 0, 0x00, 0x00, 1, 0, 0, 0x00},
+  {0x1083, "pto.tpush_to_aic", 0, 0x00, 0x00, 1, 0, 0, 0x00},
+  {0x1084, "pto.tpop_from_aic", 0, 0x01, 0x02, 0, 1, 0, 0x00},
+  {0x1085, "pto.tpop_from_aiv", 0, 0x01, 0x02, 0, 1, 0, 0x00},
+  {0x1086, "pto.tfree_from_aic", 0, 0x00, 0x00, 0, 0, 0, 0x00},
+  {0x1087, "pto.tfree_from_aiv", 0, 0x00, 0x00, 0, 0, 0, 0x00},
+  {0x1088, "pto.set_validshape", 0, 0x00, 0x00, 3, 0, 0, 0x00},
+  {0x1089, "pto.tconcat", 0, 0x00, 0x00, 3, 0, 0, 0x00},
+  {0x108A, "pto.trowprod", 0, 0x00, 0x00, 3, 0, 0, 0x00},
+  {0x108B, "pto.initialize_l2g2l_pipe", 0, 0x01, 0x02, 0, 1, 0, 0x00},
+  {0x108C, "pto.initialize_l2l_pipe", 0, 0x01, 0x02, 0, 1, 0, 0x00},
+  {0x108D, "pto.tpush", 0, 0x00, 0x00, 2, 0, 0, 0x00},
+  {0x108E, "pto.declare_tile", 0, 0x01, 0x00, 0, 1, 0, 0x00},
+  {0x108F, "pto.tpop", 0, 0x00, 0x00, 2, 0, 0, 0x00},
+  {0x1090, "pto.tfree", 0, 0x00, 0x00, 1, 0, 0, 0x00},
+  {0x1091, "pto.comm.tput", 0, 0x00, 0x02, 0, 0, 0, 0x00},
+  {0x1092, "pto.comm.tget", 0, 0x00, 0x02, 0, 0, 0, 0x00},
+  {0x1093, "pto.comm.tnotify", 0, 0x00, 0x02, 0, 0, 0, 0x00},
+  {0x1094, "pto.comm.twait", 0, 0x00, 0x02, 0, 0, 0, 0x00},
+  {0x1095, "pto.comm.ttest", 0, 0x01, 0x02, 0, 1, 0, 0x00},
+  {0x1096, "pto.comm.tbroadcast", 0, 0x00, 0x02, 0, 0, 0, 0x00},
+  {0x1097, "pto.comm.tgather", 0, 0x00, 0x02, 0, 0, 0, 0x00},
+  {0x1098, "pto.comm.tscatter", 0, 0x00, 0x02, 0, 0, 0, 0x00},
+  {0x1099, "pto.comm.treduce", 0, 0x00, 0x02, 0, 0, 0, 0x00},
+  {0x109A, "pto.tpartargmax", 0, 0x00, 0x00, 6, 0, 0, 0x00},
+  {0x109B, "pto.tpartargmin", 0, 0x00, 0x00, 6, 0, 0, 0x00},
+  {0x109C, "pto.tscatter.maskpattern", 0, 0x00, 0x00, 2, 0, 0, 0x00},
+  {0x109D, "pto.fusion_region", 0, 0x02, 0x00, 0, 0, 1, 0x00},
+  {0x109E, "pto.yield", 0, 0x00, 0x02, 0, 0, 0, 0x00},
   {0x2000, "arith.addi", 0, 0x01, 0x00, 2, 1, 0, 0x00},
   {0x2001, "arith.ceildivsi", 0, 0x01, 0x00, 2, 1, 0, 0x00},
   {0x2002, "arith.cmpi", 0, 0x01, 0x00, 2, 1, 0, 0x01},
@@ -167,7 +233,8 @@ inline constexpr OpInfo kOpTable[] = {
   {0x4001, "scf.if", 0, 0x00, 0x00, 1, 0, 2, 0x00},
   {0x4002, "scf.yield", 0, 0x00, 0x02, 0, 0, 0, 0x00},
   {0x6000, "func.func", 0, 0x00, 0x00, 0, 0, 0, 0x00},
-  {0x6001, "func.return", 0, 0x00, 0x00, 0, 0, 0, 0x00},
+  {0x6001, "func.return", 0, 0x00, 0x02, 0, 0, 0, 0x00},
+  {0x6002, "func.call", 0, 0x02, 0x02, 0, 0, 0, 0x00},
 };
 
 inline const OpInfo *lookupByOpcode(uint16_t opcode) {
@@ -195,6 +262,7 @@ inline std::optional<uint16_t> lookupOpcodeByName(llvm::StringRef name) {
     .Case("arith.subi", 0x2008)
     .Case("func.func", 0x6000)
     .Case("func.return", 0x6001)
+    .Case("func.call", 0x6002)
     .Case("pto.addptr", 0x1000)
     .Case("pto.alloc_tile", 0x1001)
     .Case("pto.barrier", 0x1002)
@@ -304,7 +372,7 @@ inline std::optional<uint16_t> lookupOpcodeByName(llvm::StringRef name) {
     .Case("pto.tsort32", 0x1063)
     .Case("pto.tsqrt", 0x1064)
     .Case("pto.tstore", 0x1065)
-    .Case("pto.tstore.fp", 0x1066)
+    .Case("pto.tstore_fp", 0x1066)
     .Case("pto.tsub", 0x1067)
     .Case("pto.tsubc", 0x1068)
     .Case("pto.tsubs", 0x1069)
@@ -316,9 +384,50 @@ inline std::optional<uint16_t> lookupOpcodeByName(llvm::StringRef name) {
     .Case("pto.txors", 0x106F)
     .Case("pto.wait_event", 0x1070)
     .Case("pto.tprint", 0x1071)
-    .Case("pto.subset", 0x1072)
+    .Case("pto.subview", 0x1072)
     .Case("pto.trowexpanddiv", 0x1073)
     .Case("pto.trowexpandmul", 0x1074)
+    .Case("pto.tdequant", 0x1075)
+    .Case("pto.taxpy", 0x1076)
+    .Case("pto.thistogram", 0x1077)
+    .Case("pto.tget_scale_addr", 0x1078)
+    .Case("pto.trowargmax", 0x1079)
+    .Case("pto.trowargmin", 0x107A)
+    .Case("pto.tcolargmax", 0x107B)
+    .Case("pto.tcolargmin", 0x107C)
+    .Case("pto.tsync", 0x107D)
+    .Case("pto.reserve_buffer", 0x107E)
+    .Case("pto.import_reserved_buffer", 0x107F)
+    .Case("pto.aic_initialize_pipe", 0x1080)
+    .Case("pto.aiv_initialize_pipe", 0x1081)
+    .Case("pto.tpush_to_aiv", 0x1082)
+    .Case("pto.tpush_to_aic", 0x1083)
+    .Case("pto.tpop_from_aic", 0x1084)
+    .Case("pto.tpop_from_aiv", 0x1085)
+    .Case("pto.tfree_from_aic", 0x1086)
+    .Case("pto.tfree_from_aiv", 0x1087)
+    .Case("pto.set_validshape", 0x1088)
+    .Case("pto.tconcat", 0x1089)
+    .Case("pto.trowprod", 0x108A)
+    .Case("pto.initialize_l2g2l_pipe", 0x108B)
+    .Case("pto.initialize_l2l_pipe", 0x108C)
+    .Case("pto.tpush", 0x108D)
+    .Case("pto.declare_tile", 0x108E)
+    .Case("pto.tpop", 0x108F)
+    .Case("pto.tfree", 0x1090)
+    .Case("pto.comm.tput", 0x1091)
+    .Case("pto.comm.tget", 0x1092)
+    .Case("pto.comm.tnotify", 0x1093)
+    .Case("pto.comm.twait", 0x1094)
+    .Case("pto.comm.ttest", 0x1095)
+    .Case("pto.comm.tbroadcast", 0x1096)
+    .Case("pto.comm.tgather", 0x1097)
+    .Case("pto.comm.tscatter", 0x1098)
+    .Case("pto.comm.treduce", 0x1099)
+    .Case("pto.tpartargmax", 0x109A)
+    .Case("pto.tpartargmin", 0x109B)
+    .Case("pto.fusion_region", 0x109D)
+    .Case("pto.yield", 0x109E)
     .Case("scf.for", 0x4000)
     .Case("scf.if", 0x4001)
     .Case("scf.yield", 0x4002)
@@ -350,6 +459,7 @@ inline std::optional<OpcodeAndVariant> lookupOpcodeAndVariantByFullName(llvm::St
     .Case("arith.subi", OpcodeAndVariant{0x2008, 0, 0})
     .Case("func.func", OpcodeAndVariant{0x6000, 0, 0})
     .Case("func.return", OpcodeAndVariant{0x6001, 0, 0})
+    .Case("func.call", OpcodeAndVariant{0x6002, 0, 0})
     .Case("pto.addptr", OpcodeAndVariant{0x1000, 0, 0})
     .Case("pto.alloc_tile", OpcodeAndVariant{0x1001, 0, 0})
     .Case("pto.barrier", OpcodeAndVariant{0x1002, 0, 0})
@@ -455,7 +565,7 @@ inline std::optional<OpcodeAndVariant> lookupOpcodeAndVariantByFullName(llvm::St
     .Case("pto.tsort32", OpcodeAndVariant{0x1063, 0, 0})
     .Case("pto.tsqrt", OpcodeAndVariant{0x1064, 0, 0})
     .Case("pto.tstore", OpcodeAndVariant{0x1065, 0, 0})
-    .Case("pto.tstore.fp", OpcodeAndVariant{0x1066, 0, 0})
+    .Case("pto.tstore_fp", OpcodeAndVariant{0x1066, 0, 0})
     .Case("pto.tsub", OpcodeAndVariant{0x1067, 0, 0})
     .Case("pto.tsubc", OpcodeAndVariant{0x1068, 0, 0})
     .Case("pto.tsubs", OpcodeAndVariant{0x1069, 0, 0})
@@ -467,62 +577,118 @@ inline std::optional<OpcodeAndVariant> lookupOpcodeAndVariantByFullName(llvm::St
     .Case("pto.txors", OpcodeAndVariant{0x106F, 0, 0})
     .Case("pto.wait_event", OpcodeAndVariant{0x1070, 0, 0})
     .Case("pto.tprint", OpcodeAndVariant{0x1071, 0, 0})
-    .Case("pto.subset", OpcodeAndVariant{0x1072, 0, 0})
+    .Case("pto.subview", OpcodeAndVariant{0x1072, 0, 0})
     .Case("pto.trowexpanddiv", OpcodeAndVariant{0x1073, 0, 0})
     .Case("pto.trowexpandmul", OpcodeAndVariant{0x1074, 0, 0})
+    .Case("pto.tdequant", OpcodeAndVariant{0x1075, 0, 0})
+    .Case("pto.taxpy", OpcodeAndVariant{0x1076, 0, 0})
+    .Case("pto.thistogram", OpcodeAndVariant{0x1077, 0, 0})
+    .Case("pto.tget_scale_addr", OpcodeAndVariant{0x1078, 0, 0})
+    .Case("pto.trowargmax", OpcodeAndVariant{0x1079, 0, 0})
+    .Case("pto.trowargmin", OpcodeAndVariant{0x107A, 0, 0})
+    .Case("pto.tcolargmax", OpcodeAndVariant{0x107B, 0, 0})
+    .Case("pto.tcolargmin", OpcodeAndVariant{0x107C, 0, 0})
+    .Case("pto.tsync", OpcodeAndVariant{0x107D, 0, 0})
+    .Case("pto.reserve_buffer", OpcodeAndVariant{0x107E, 0, 0})
+    .Case("pto.import_reserved_buffer", OpcodeAndVariant{0x107F, 0, 0})
+    .Case("pto.aic_initialize_pipe", OpcodeAndVariant{0x1080, 0, 0})
+    .Case("pto.aiv_initialize_pipe", OpcodeAndVariant{0x1081, 0, 0})
+    .Case("pto.tpush_to_aiv", OpcodeAndVariant{0x1082, 0, 0})
+    .Case("pto.tpush_to_aic", OpcodeAndVariant{0x1083, 0, 0})
+    .Case("pto.tpop_from_aic", OpcodeAndVariant{0x1084, 0, 0})
+    .Case("pto.tpop_from_aiv", OpcodeAndVariant{0x1085, 0, 0})
+    .Case("pto.tfree_from_aic", OpcodeAndVariant{0x1086, 0, 0})
+    .Case("pto.tfree_from_aiv", OpcodeAndVariant{0x1087, 0, 0})
+    .Case("pto.set_validshape", OpcodeAndVariant{0x1088, 0, 0})
+    .Case("pto.tconcat", OpcodeAndVariant{0x1089, 0, 0})
+    .Case("pto.trowprod", OpcodeAndVariant{0x108A, 0, 0})
+    .Case("pto.initialize_l2g2l_pipe", OpcodeAndVariant{0x108B, 0, 0})
+    .Case("pto.initialize_l2l_pipe", OpcodeAndVariant{0x108C, 0, 0})
+    .Case("pto.tpush", OpcodeAndVariant{0x108D, 0, 0})
+    .Case("pto.declare_tile", OpcodeAndVariant{0x108E, 0, 0})
+    .Case("pto.tpop", OpcodeAndVariant{0x108F, 0, 0})
+    .Case("pto.tfree", OpcodeAndVariant{0x1090, 0, 0})
+    .Case("pto.comm.tput", OpcodeAndVariant{0x1091, 0, 0})
+    .Case("pto.comm.tget", OpcodeAndVariant{0x1092, 0, 0})
+    .Case("pto.comm.tnotify", OpcodeAndVariant{0x1093, 0, 0})
+    .Case("pto.comm.twait", OpcodeAndVariant{0x1094, 0, 0})
+    .Case("pto.comm.ttest", OpcodeAndVariant{0x1095, 0, 0})
+    .Case("pto.comm.tbroadcast", OpcodeAndVariant{0x1096, 0, 0})
+    .Case("pto.comm.tgather", OpcodeAndVariant{0x1097, 0, 0})
+    .Case("pto.comm.tscatter", OpcodeAndVariant{0x1098, 0, 0})
+    .Case("pto.comm.treduce", OpcodeAndVariant{0x1099, 0, 0})
+    .Case("pto.tpartargmax", OpcodeAndVariant{0x109A, 0, 0})
+    .Case("pto.tpartargmin", OpcodeAndVariant{0x109B, 0, 0})
+    .Case("pto.fusion_region", OpcodeAndVariant{0x109D, 0, 0})
+    .Case("pto.yield", OpcodeAndVariant{0x109E, 0, 0})
     .Case("scf.for", OpcodeAndVariant{0x4000, 0, 0})
     .Case("scf.if", OpcodeAndVariant{0x4001, 0, 0})
     .Case("scf.yield", OpcodeAndVariant{0x4002, 0, 0})
-    .Case("pto.section.cube", OpcodeAndVariant{0x0006, 1, 0})
-    .Case("pto.section.vector", OpcodeAndVariant{0x0006, 1, 1})
-    .Case("pto.tgemv", OpcodeAndVariant{0x102A, 1, 0})
-    .Case("pto.tgemv.acc", OpcodeAndVariant{0x102A, 1, 1})
-    .Case("pto.tgemv.bias", OpcodeAndVariant{0x102A, 1, 2})
-    .Case("pto.tgemv.mx", OpcodeAndVariant{0x102A, 1, 3})
-    .Case("pto.tgemv.mx.acc", OpcodeAndVariant{0x102A, 1, 4})
-    .Case("pto.tgemv.mx.bias", OpcodeAndVariant{0x102A, 1, 5})
-    .Case("pto.tmatmul", OpcodeAndVariant{0x1032, 1, 0})
-    .Case("pto.tmatmul.acc", OpcodeAndVariant{0x1032, 1, 1})
-    .Case("pto.tmatmul.bias", OpcodeAndVariant{0x1032, 1, 2})
-    .Case("pto.tmatmul.mx", OpcodeAndVariant{0x1033, 1, 0})
-    .Case("pto.tmatmul.mx.acc", OpcodeAndVariant{0x1033, 1, 1})
-    .Case("pto.tmatmul.mx.bias", OpcodeAndVariant{0x1033, 1, 2})
+    .Case("pto.section.cube",
+          OpcodeAndVariant{0x0006, kHasVariant, kSectionCubeVariant})
+    .Case("pto.section.vector",
+          OpcodeAndVariant{0x0006, kHasVariant, kSectionVectorVariant})
+    .Case("pto.tgemv",
+          OpcodeAndVariant{0x102A, kHasVariant, kVariantDefault})
+    .Case("pto.tgemv.acc",
+          OpcodeAndVariant{0x102A, kHasVariant, kVariantAcc})
+    .Case("pto.tgemv.bias",
+          OpcodeAndVariant{0x102A, kHasVariant, kVariantBias})
+    .Case("pto.tgemv.mx",
+          OpcodeAndVariant{0x102A, kHasVariant, kVariantMx})
+    .Case("pto.tgemv.mx.acc",
+          OpcodeAndVariant{0x102A, kHasVariant, kVariantMxAcc})
+    .Case("pto.tgemv.mx.bias",
+          OpcodeAndVariant{0x102A, kHasVariant, kVariantMxBias})
+    .Case("pto.tmatmul",
+          OpcodeAndVariant{0x1032, kHasVariant, kVariantDefault})
+    .Case("pto.tmatmul.acc",
+          OpcodeAndVariant{0x1032, kHasVariant, kVariantAcc})
+    .Case("pto.tmatmul.bias",
+          OpcodeAndVariant{0x1032, kHasVariant, kVariantBias})
+    .Case("pto.tmatmul.mx",
+          OpcodeAndVariant{0x1033, kHasVariant, kVariantDefault})
+    .Case("pto.tmatmul.mx.acc",
+          OpcodeAndVariant{0x1033, kHasVariant, kVariantAcc})
+    .Case("pto.tmatmul.mx.bias",
+          OpcodeAndVariant{0x1033, kHasVariant, kVariantBias})
     .Default(std::nullopt);
 }
 
 inline const char *fullNameFromOpcodeVariant(uint16_t opcode, uint8_t variant) {
   const OpInfo *info = lookupByOpcode(opcode);
   if (!info) return nullptr;
+  if (opcode == kTscatterMaskOpcode) return "pto.tscatter";
   if (!info->has_variant_u8) return info->name;
   switch (opcode) {
   case 0x0006:
     switch (variant) {
-    case 0: return "pto.section.cube";
-    case 1: return "pto.section.vector";
+    case kSectionCubeVariant: return "pto.section.cube";
+    case kSectionVectorVariant: return "pto.section.vector";
     default: return info->name;
     }
   case 0x102A:
     switch (variant) {
-    case 0: return "pto.tgemv";
-    case 1: return "pto.tgemv.acc";
-    case 2: return "pto.tgemv.bias";
-    case 3: return "pto.tgemv.mx";
-    case 4: return "pto.tgemv.mx.acc";
-    case 5: return "pto.tgemv.mx.bias";
+    case kVariantDefault: return "pto.tgemv";
+    case kVariantAcc: return "pto.tgemv.acc";
+    case kVariantBias: return "pto.tgemv.bias";
+    case kVariantMx: return "pto.tgemv.mx";
+    case kVariantMxAcc: return "pto.tgemv.mx.acc";
+    case kVariantMxBias: return "pto.tgemv.mx.bias";
     default: return info->name;
     }
   case 0x1032:
     switch (variant) {
-    case 0: return "pto.tmatmul";
-    case 1: return "pto.tmatmul.acc";
-    case 2: return "pto.tmatmul.bias";
+    case kVariantDefault: return "pto.tmatmul";
+    case kVariantAcc: return "pto.tmatmul.acc";
+    case kVariantBias: return "pto.tmatmul.bias";
     default: return info->name;
     }
   case 0x1033:
     switch (variant) {
-    case 0: return "pto.tmatmul.mx";
-    case 1: return "pto.tmatmul.mx.acc";
-    case 2: return "pto.tmatmul.mx.bias";
+    case kVariantDefault: return "pto.tmatmul.mx";
+    case kVariantAcc: return "pto.tmatmul.mx.acc";
+    case kVariantBias: return "pto.tmatmul.mx.bias";
     default: return info->name;
     }
   default: return info->name;
@@ -533,26 +699,26 @@ inline std::optional<int> lookupOperandsByVariant(uint16_t opcode, uint8_t varia
   switch (opcode) {
   case 0x102A:
     switch (variant) {
-    case 0: return 3;
-    case 1: return 4;
-    case 2: return 4;
-    case 3: return 5;
-    case 4: return 6;
-    case 5: return 6;
+    case kVariantDefault: return kTgemvOperandCount;
+    case kVariantAcc: return kTgemvAccOperandCount;
+    case kVariantBias: return kTgemvBiasOperandCount;
+    case kVariantMx: return kTgemvMxOperandCount;
+    case kVariantMxAcc: return kTgemvMxAccOperandCount;
+    case kVariantMxBias: return kTgemvMxBiasOperandCount;
     default: return std::nullopt;
     }
   case 0x1032:
     switch (variant) {
-    case 0: return 3;
-    case 1: return 4;
-    case 2: return 4;
+    case kVariantDefault: return kTmatmulOperandCount;
+    case kVariantAcc: return kTmatmulAccOperandCount;
+    case kVariantBias: return kTmatmulBiasOperandCount;
     default: return std::nullopt;
     }
   case 0x1033:
     switch (variant) {
-    case 0: return 5;
-    case 1: return 6;
-    case 2: return 6;
+    case kVariantDefault: return kTmatmulMxOperandCount;
+    case kVariantAcc: return kTmatmulMxAccOperandCount;
+    case kVariantBias: return kTmatmulMxBiasOperandCount;
     default: return std::nullopt;
     }
   default: return std::nullopt;

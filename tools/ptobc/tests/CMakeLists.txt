@@ -50,9 +50,79 @@ add_test(NAME ptobc_tprint_v0_encode
     ${CMAKE_CURRENT_LIST_DIR}/tprint_v0_encode.sh
 )
 
+add_test(NAME ptobc_tci_trowexpandadd_tmp_v0_encode
+  COMMAND ${CMAKE_COMMAND} -E env
+    PTOBC_BIN=$<TARGET_FILE:ptobc>
+    TESTDATA_DIR=${PTObc_TESTDATA_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/tci_trowexpandadd_tmp_v0_encode.sh
+)
+
+add_test(NAME ptobc_tpartarg_v0_encode
+  COMMAND ${CMAKE_COMMAND} -E env
+    PTOBC_BIN=$<TARGET_FILE:ptobc>
+    TESTDATA_DIR=${PTObc_TESTDATA_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/tpartarg_v0_encode.sh
+)
+
+add_test(NAME ptobc_func_call_v0_encode
+  COMMAND ${CMAKE_COMMAND} -E env
+    PTOBC_BIN=$<TARGET_FILE:ptobc>
+    TESTDATA_DIR=${PTObc_TESTDATA_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/func_call_v0_encode.sh
+)
+
 add_test(NAME ptobc_recent_ops_v0_encode
   COMMAND ${CMAKE_COMMAND} -E env
     PTOBC_BIN=$<TARGET_FILE:ptobc>
     TESTDATA_DIR=${PTObc_TESTDATA_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/recent_ops_v0_encode.sh
+)
+
+add_test(NAME ptobc_frontend_pipe_v0_encode
+  COMMAND ${CMAKE_COMMAND} -E env
+    PTOBC_BIN=$<TARGET_FILE:ptobc>
+    TESTDATA_DIR=${PTObc_TESTDATA_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/frontend_pipe_v0_encode.sh
+)
+
+add_test(NAME ptobc_internal_pipe_v0_encode
+  COMMAND ${CMAKE_COMMAND} -E env
+    PTOBC_BIN=$<TARGET_FILE:ptobc>
+    TESTDATA_DIR=${PTObc_TESTDATA_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/internal_pipe_v0_encode.sh
+)
+
+add_test(NAME ptobc_tconcat_set_validshape_v0_encode
+  COMMAND ${CMAKE_COMMAND} -E env
+    PTOBC_BIN=$<TARGET_FILE:ptobc>
+    TESTDATA_DIR=${PTObc_TESTDATA_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/tconcat_set_validshape_v0_encode.sh
+)
+
+add_test(NAME ptobc_tstore_fp_v0_encode
+  COMMAND ${CMAKE_COMMAND} -E env
+    PTOBC_BIN=$<TARGET_FILE:ptobc>
+    TESTDATA_DIR=${PTObc_TESTDATA_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/tstore_fp_v0_encode.sh
+)
+
+add_test(NAME ptobc_tdequant_v0_encode
+  COMMAND ${CMAKE_COMMAND} -E env
+    PTOBC_BIN=$<TARGET_FILE:ptobc>
+    TESTDATA_DIR=${PTObc_TESTDATA_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/tdequant_v0_encode.sh
+)
+
+add_test(NAME ptobc_tscatter_maskpattern_v0_encode
+  COMMAND ${CMAKE_COMMAND} -E env
+    PTOBC_BIN=$<TARGET_FILE:ptobc>
+    TESTDATA_DIR=${PTObc_TESTDATA_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/tscatter_maskpattern_v0_encode.sh
+)
+
+add_test(NAME ptobc_tcvt_satmode_v0_encode
+  COMMAND ${CMAKE_COMMAND} -E env
+    PTOBC_BIN=$<TARGET_FILE:ptobc>
+    TESTDATA_DIR=${PTObc_TESTDATA_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/tcvt_satmode_v0_encode.sh
 )

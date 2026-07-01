@@ -7,7 +7,40 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 cmake_minimum_required(VERSION 3.20.0)
-project(ptoas VERSION 0.24)
+
+# CANN/Ascend CMake packages used by downstream PTOAS builds may still use the
+# pre-CMake-3.30 FetchContent_Populate(<declared-name>) pattern. Keep that
+# compatibility path enabled so CMake 4.x developer warnings do not become
+# configure errors when users build with strict warning settings. The default
+# covers nested third-party directories that set their own cmake_minimum_required().
+if(POLICY CMP0169)
+  cmake_policy(SET CMP0169 OLD)
+  set(CMAKE_POLICY_DEFAULT_CMP0169 OLD)
+endif()
+
+project(ptoas VERSION 0.49)
+
+option(PTOAS_VALIDATE_CMAKE4_FETCHCONTENT_COMPAT
+       "Validate CMake 4 compatibility for legacy FetchContent users" OFF)
+if(PTOAS_VALIDATE_CMAKE4_FETCHCONTENT_COMPAT)
+  set(_ptoas_cmp0169_check_dir "${CMAKE_BINARY_DIR}/cmake-cmp0169-compat")
+  file(MAKE_DIRECTORY "${_ptoas_cmp0169_check_dir}/nested/cann-cmake")
+  file(WRITE "${_ptoas_cmp0169_check_dir}/nested/cann-cmake/CMakeLists.txt"
+       "cmake_minimum_required(VERSION 3.20)\n"
+       "project(ptoas_cmp0169_cann_cmake_fixture NONE)\n")
+  file(WRITE "${_ptoas_cmp0169_check_dir}/nested/CMakeLists.txt" [=[
+cmake_minimum_required(VERSION 3.20)
+project(ptoas_cmp0169_nested_fixture NONE)
+include(FetchContent)
+FetchContent_Declare(cann-cmake SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/cann-cmake")
+FetchContent_GetProperties(cann-cmake)
+if(NOT cann-cmake_POPULATED)
+  FetchContent_Populate(cann-cmake)
+endif()
+]=])
+  add_subdirectory("${_ptoas_cmp0169_check_dir}/nested"
+                   "${_ptoas_cmp0169_check_dir}/nested-build")
+endif()
 
 set(PTOAS_RELEASE_VERSION_OVERRIDE ""
     CACHE STRING "Override the version printed by ptoas --version")
@@ -74,6 +107,17 @@ include(AddMLIR)
 # =========================================================
 # 3. 配置构建环境
 # =========================================================
+# Keep warning policy in CMake so CI, wheel, and external build entrypoints
+# all enforce the same diagnostics contract.
+option(PTOAS_ENABLE_WERROR "Treat PTOAS warnings as errors" ON)
+if(PTOAS_ENABLE_WERROR)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Werror>)
+  elseif(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/WX>)
+  endif()
+endif()
+
 # macOS: 移除已废弃的 -undefined suppress，避免 ld 警告（保留 -undefined dynamic_lookup 即可）
 if(APPLE)
   foreach(_var CMAKE_SHARED_MODULE_CREATE_CXX_FLAGS CMAKE_MODULE_LINKER_FLAGS)
@@ -90,6 +134,11 @@ include_directories(${PROJECT_BINARY_DIR}/include)
 link_directories(${LLVM_BUILD_LIBRARY_DIR})
 add_definitions(${LLVM_DEFINITIONS})
 
+# =========================================================
+# 3.1 Testing option setup
+# =========================================================
+include(CTest)
+
 # 开启 Python 绑定选项
 option(PTO_ENABLE_PYTHON_BINDING "Enable Python bindings" ON)
 
@@ -101,6 +150,7 @@ if(PTO_ENABLE_PYTHON_BINDING)
   set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python/pto)
 
   add_subdirectory(python)
+  add_subdirectory(tilelang-dsl)
 endif()
 
 # =========================================================
@@ -113,10 +163,79 @@ add_subdirectory(tools)
 # =========================================================
 # 4.1 Tests (ctest)
 # =========================================================
-include(CTest)
 if(BUILD_TESTING)
   enable_testing()
+  if(PTO_ENABLE_PYTHON_BINDING)
+    get_filename_component(_llvm_root "${LLVM_DIR}/../../.." ABSOLUTE)
+    set(_pto_python_test_pythonpath
+      "${CMAKE_BINARY_DIR}/python:${MLIR_PYTHON_PACKAGE_DIR}:${CMAKE_INSTALL_PREFIX}:$ENV{PYTHONPATH}"
+    )
+    if(DEFINED ENV{PTO_INSTALL_DIR} AND NOT "$ENV{PTO_INSTALL_DIR}" STREQUAL "")
+      set(_pto_python_test_pythonpath "$ENV{PTO_INSTALL_DIR}:${_pto_python_test_pythonpath}")
+    endif()
+    set(_pto_python_test_env
+      "PYTHONPATH=${_pto_python_test_pythonpath}"
+      "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/lib:${_llvm_root}/lib:${CMAKE_INSTALL_PREFIX}/lib:$ENV{LD_LIBRARY_PATH}"
+      "PATH=${CMAKE_BINARY_DIR}/tools/ptoas:${CMAKE_INSTALL_PREFIX}/bin:$ENV{PATH}"
+    )
+
+    add_subdirectory(ptodsl/tests)
+    add_test(
+      NAME tilelang_dsl_import
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tilelang-dsl/tests/import_tilelang_dsl.py"
+    )
+    set_tests_properties(tilelang_dsl_import PROPERTIES
+      LABELS "PTODSL"
+      ENVIRONMENT "${_pto_python_test_env}"
+    )
+    add_test(
+      NAME tilelang_dsl_unittest
+      COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+              -s "${CMAKE_CURRENT_SOURCE_DIR}/tilelang-dsl/tests"
+              -p "test_*.py"
+    )
+    set_tests_properties(tilelang_dsl_unittest PROPERTIES
+      LABELS "PTODSL"
+      ENVIRONMENT "${_pto_python_test_env}"
+    )
+  endif()
   add_subdirectory(tools/ptobc/tests)
+endif()
+
+# =========================================================
+# 4.2 Lit tests
+# =========================================================
+if(BUILD_TESTING)
+  add_subdirectory(test/lit)
+
+  set(_pto_check_ctest_depends)
+  foreach(_target IN ITEMS PTOPythonModules pto-opt ptoas ptobc)
+    if(TARGET ${_target})
+      list(APPEND _pto_check_ctest_depends ${_target})
+    endif()
+  endforeach()
+
+  if(NOT TARGET check-ctest)
+    add_custom_target(check-ctest
+      COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure
+      WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+      DEPENDS ${_pto_check_ctest_depends}
+      USES_TERMINAL
+      COMMENT "Running the CTest regression tests"
+    )
+    set_target_properties(check-ctest PROPERTIES FOLDER "Tests")
+  endif()
+
+  if(NOT TARGET check)
+    add_custom_target(check)
+  endif()
+  if(TARGET check-pto)
+    add_dependencies(check check-pto)
+  endif()
+  if(TARGET check-ctest)
+    add_dependencies(check check-ctest)
+  endif()
 endif()
 
 # =========================================================

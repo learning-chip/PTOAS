@@ -154,14 +154,20 @@ public:
 public:
   SmallVector<int> eventIds;
   // Root buffers participating in the dependency that created this sync pair.
-  // Used by redundant-sync pruning to avoid removing syncs from unrelated
-  // producer/consumer chains that happen to share the same pipe pair.
+  // These are kept for allocation/widening heuristics and debug printing; set/
+  // wait redundancy pruning is based on the pipe pair semantics.
   SmallVector<Value> depRootBuffers;
   bool uselessSync{false};
   int eventIdNum{1};
+  // For multi-buffer dyn-event sync: the slot SSA expression at this access
+  // site. set_flag_dyn / wait_flag_dyn use `slotSSAExpr % slotCount` as the
+  // hardware event-id index. Empty when this sync is single-buffer.
+  Value slotSSAExpr;
+  uint32_t slotCount{1};
   Value lowestCommonAncestorBuffer{nullptr};
   int reuseCntForWiden{0};
   bool reallocatedLoopHeadTailSync{false};
+  bool autoSyncTailBarrier{false};
   TCoreType syncCoreType{TCoreType::CUBE_OR_VECTOR};
   Value block_sync_event_value{nullptr};
  
@@ -169,9 +175,9 @@ public:
   SyncOperation(TYPE type, pto::PipelineType srcPipe, pto::PipelineType dstPipe,
                 unsigned kSyncIndex, unsigned syncIRIndex,
                 std::optional<int> forEndIndex, bool isComp = false)
-      : eventIds({}), type_(type), srcPipe_(srcPipe), dstPipe_(dstPipe),
-        kSyncIndex_(kSyncIndex), syncIRIndex_(syncIRIndex),
-        forEndIndex_(forEndIndex), isCompensation(isComp) {};
+      : isCompensation(isComp), eventIds({}), type_(type), srcPipe_(srcPipe),
+        dstPipe_(dstPipe), kSyncIndex_(kSyncIndex), syncIRIndex_(syncIRIndex),
+        forEndIndex_(forEndIndex) {};
  
   ~SyncOperation() = default;
  
@@ -207,6 +213,8 @@ public:
  
   // 设置为 PipeAll (用于资源耗尽时的降级)
   void SetPipeAll();
+  bool IsAutoSyncTailBarrier() const { return autoSyncTailBarrier; }
+  void MarkAutoSyncTailBarrier() { autoSyncTailBarrier = true; }
  
 private:
   TYPE type_;
@@ -217,6 +225,11 @@ private:
   std::optional<int> forEndIndex_{};
   unsigned depSyncIRIndex_{0};
 };
+
+SmallVector<const void *>
+canonicalizeSyncDepRoots(const SmallVector<Value> &roots);
+
+bool hasSameSyncDepRoots(const SyncOperation *lhs, const SyncOperation *rhs);
  
 using SyncOps = std::deque<SyncOperation *>;
  
@@ -340,6 +353,9 @@ public:
   UNIT_FLAG unitFlagModeAsWait{UNIT_FLAG::DISABLED};
   CompoundInstanceElement *linkedUnitFlagCompAsSet{nullptr};
   CompoundInstanceElement *linkedUnitFlagCompAsWait{nullptr};
+  // Macro-like operations may be represented by multiple SyncIR compounds that
+  // point at the same source operation. The phase id distinguishes those
+  // synthetic compounds without changing the source IR.
   int macroOpInstanceId{-1};
  
 public:

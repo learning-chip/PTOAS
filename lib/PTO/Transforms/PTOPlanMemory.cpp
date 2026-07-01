@@ -11,17 +11,25 @@
 
 #include "PTOPlanMemory.h"
 
+#include "PTO/IR/PTOMultiBuffer.h"
+#include "PTO/IR/PTOTypeUtils.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/AsmState.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "AllocToPointerCast.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 #define DEBUG_TYPE "pto-plan-memory"
@@ -39,32 +47,162 @@ using namespace pto;
 
 namespace {
 
+constexpr int64_t kBitsPerByte = 8;
+constexpr unsigned kI32BitWidth = 32;
+constexpr unsigned kMemoryEffectReserveSize = 8;
+constexpr int kSingleBufferCount = 1;
+constexpr int kDoubleBufferCount = 2;
+constexpr int64_t kA5VecLocalMemBits = 2031616;
+constexpr int64_t kA3VecLocalMemBits = 1572864;
+constexpr int64_t kMatLocalMemBits = 4194304;
+constexpr int64_t kLocalMemAlignmentBytes = 256;
+
 struct LocalMemSpec {
   int64_t capacityBits = 0;
   int64_t alignBytes = 1;
 };
 
-static int64_t ceilDivBitsToBytes(int64_t bits) { return (bits + 7) / 8; }
+static int64_t ceilDivBitsToBytes(int64_t bits) {
+  return (bits + kBitsPerByte - 1) / kBitsPerByte;
+}
 
 static int64_t alignUpBytes(int64_t value, int64_t align) {
-  if (align <= 1)
+  int64_t safeAlign = std::max<int64_t>(align, 1);
+  if (safeAlign == 1)
     return value;
-  int64_t rem = value % align;
+  int64_t rem = value % safeAlign;
   if (rem == 0)
     return value;
-  return value + (align - rem);
+  return value + (safeAlign - rem);
+}
+
+static size_t plannerAlignBitsFromBytes(size_t alignBytes) {
+  return std::max<size_t>(alignBytes, 1) * kBitsPerByte;
 }
 
 static LocalMemSpec getLocalMemSpec(Operation *op, AddressSpace as) {
   switch (as) {
   case AddressSpace::VEC:
-    return isTargetArchA5(op) ? LocalMemSpec{2031616, 256}
-                              : LocalMemSpec{1572864, 256};
+    return isTargetArchA5(op)
+               ? LocalMemSpec{kA5VecLocalMemBits, kLocalMemAlignmentBytes}
+               : LocalMemSpec{kA3VecLocalMemBits, kLocalMemAlignmentBytes};
   case AddressSpace::MAT:
-    return LocalMemSpec{4194304, 256};
+    return LocalMemSpec{kMatLocalMemBits, kLocalMemAlignmentBytes};
   default:
     return LocalMemSpec{};
   }
+}
+
+static void collectStableValueOrder(Region &region,
+                                    AsmState &asmState,
+                                    DenseMap<Value, std::string> &stableValueKeys,
+                                    SmallVectorImpl<Value> &seenValues) {
+  auto recordValue = [&](Value value) {
+    if (stableValueKeys.find(value) != stableValueKeys.end())
+      return;
+    std::string key;
+    llvm::raw_string_ostream os(key);
+    value.printAsOperand(os, asmState);
+    stableValueKeys[value] = os.str();
+    seenValues.push_back(value);
+  };
+
+  for (Block &block : region) {
+    for (BlockArgument blockArg : block.getArguments())
+      recordValue(blockArg);
+    for (Operation &op : block) {
+      for (Value result : op.getResults())
+        recordValue(result);
+      for (Region &nestedRegion : op.getRegions())
+        collectStableValueOrder(nestedRegion, asmState, stableValueKeys,
+                                seenValues);
+    }
+  }
+}
+
+static StableValueOrderMap buildStableValueOrder(func::FuncOp func) {
+  DenseMap<Value, std::string> stableValueKeys;
+  SmallVector<Value> seenValues;
+  AsmState asmState(func);
+  collectStableValueOrder(func.getBody(), asmState, stableValueKeys, seenValues);
+
+  llvm::sort(seenValues, [&](Value lhs, Value rhs) {
+    const std::string &lhsKey = stableValueKeys.find(lhs)->second;
+    const std::string &rhsKey = stableValueKeys.find(rhs)->second;
+    if (lhsKey != rhsKey)
+      return lhsKey < rhsKey;
+    return isLessValue(lhs, rhs);
+  });
+
+  StableValueOrderMap stableValueOrder;
+  for (auto [index, value] : llvm::enumerate(seenValues))
+    stableValueOrder[value] = index;
+  return stableValueOrder;
+}
+
+static uint32_t lookupStableValueOrder(
+    Value value, const StableValueOrderMap &stableValueOrder) {
+  auto it = stableValueOrder.find(value);
+  if (it != stableValueOrder.end())
+    return it->second;
+  return std::numeric_limits<uint32_t>::max();
+}
+
+static void sortValuesByStableOrder(
+    SmallVectorImpl<Value> &values,
+    const StableValueOrderMap &stableValueOrder) {
+  llvm::sort(values, [&](Value lhs, Value rhs) {
+    uint32_t lhsOrder = lookupStableValueOrder(lhs, stableValueOrder);
+    uint32_t rhsOrder = lookupStableValueOrder(rhs, stableValueOrder);
+    if (lhsOrder != rhsOrder)
+      return lhsOrder < rhsOrder;
+    return isLessValue(lhs, rhs);
+  });
+}
+
+static SmallVector<Value> getScratchBuffersFromEffects(Operation *op,
+                                                       ValueRange dpsInits,
+                                                       const StableValueOrderMap &stableValueOrder) {
+  SmallVector<Value> scratchBuffers;
+  auto memEffect = dyn_cast<MemoryEffectOpInterface>(op);
+  if (!memEffect)
+    return scratchBuffers;
+
+  SmallVector<SideEffects::EffectInstance<MemoryEffects::Effect>,
+              kMemoryEffectReserveSize>
+      effects;
+  memEffect.getEffects(effects);
+  for (const auto &effect : effects) {
+    if (!isa<MemoryEffects::Write>(effect.getEffect()))
+      continue;
+    Value value = effect.getValue();
+    if (!value)
+      continue;
+    if (!llvm::is_contained(op->getOperands(), value))
+      continue;
+    if (llvm::is_contained(dpsInits, value))
+      continue;
+    if (!llvm::is_contained(scratchBuffers, value))
+      scratchBuffers.push_back(value);
+  }
+  sortValuesByStableOrder(scratchBuffers, stableValueOrder);
+  return scratchBuffers;
+}
+
+static SmallVector<ValuePair>
+getScratchConflictPairsFromEffects(Operation *op, ValueRange dpsInits,
+                                   const StableValueOrderMap &stableValueOrder) {
+  SmallVector<ValuePair> conflictPairs;
+  SmallVector<Value> scratchBuffers =
+      getScratchBuffersFromEffects(op, dpsInits, stableValueOrder);
+  for (Value scratch : scratchBuffers) {
+    for (Value dst : dpsInits) {
+      if (!scratch || !dst || scratch == dst)
+        continue;
+      conflictPairs.emplace_back(scratch, dst);
+    }
+  }
+  return conflictPairs;
 }
 
 enum class ReserveBufferMode {
@@ -82,58 +220,59 @@ struct ReserveBufferPlan {
   int64_t alignBytes = 1;
 };
 
-static LogicalResult analyzeReserveBufferPlan(func::FuncOp funcOp,
-                                              ReserveBufferPlan &plan) {
+using ReserveBufferPlans = SmallVector<ReserveBufferPlan>;
+
+static LogicalResult analyzeReserveBufferPlans(func::FuncOp funcOp,
+                                               ReserveBufferPlans &plans) {
   SmallVector<ReserveBufferOp> reserveOps;
   funcOp.walk(
       [&](ReserveBufferOp reserveOp) { reserveOps.push_back(reserveOp); });
 
   if (reserveOps.empty())
     return success();
-  if (reserveOps.size() > 1) {
-    return funcOp.emitOpError(
-        "expects at most one pto.reserve_buffer per function");
-  }
 
-  ReserveBufferOp reserveOp = reserveOps.front();
-  AddressSpace as = reserveOp.getLocation().getAddressSpace();
-  auto spec = getLocalMemSpec(reserveOp.getOperation(), as);
-  if (spec.capacityBits <= 0 || spec.alignBytes <= 0)
-    return reserveOp.emitOpError("unsupported reserve_buffer location");
+  for (ReserveBufferOp reserveOp : reserveOps) {
+    AddressSpace as = reserveOp.getLocation().getAddressSpace();
+    auto spec = getLocalMemSpec(reserveOp.getOperation(), as);
+    if (spec.capacityBits <= 0 || spec.alignBytes <= 0)
+      return reserveOp.emitOpError("unsupported reserve_buffer location");
 
-  int64_t capacityBytes = spec.capacityBits / 8;
-  int64_t sizeBytes = reserveOp.getSize();
-  bool autoAlloc = reserveOp.getAutoAlloc();
-  plan.mode = autoAlloc ? ReserveBufferMode::Auto : ReserveBufferMode::Manual;
-  plan.reserveOp = reserveOp;
-  plan.addressSpace = as;
-  plan.sizeBytes = sizeBytes;
-  plan.capacityBytes = capacityBytes;
-  plan.alignBytes = spec.alignBytes;
+    int64_t capacityBytes = spec.capacityBits / kBitsPerByte;
+    int64_t sizeBytes = reserveOp.getSize();
+    bool autoAlloc = reserveOp.getAutoAlloc();
 
-  // Auto mode only declares that one contiguous region must be reserved.
-  // The concrete base is filled later from a hole in the target local space.
-  if (autoAlloc) {
-    if (reserveOp.getBaseAttr()) {
-      return reserveOp.emitOpError(
-          "expects 'base' to be absent when 'auto' is true");
+    ReserveBufferPlan &plan = plans.emplace_back();
+    plan.mode = autoAlloc ? ReserveBufferMode::Auto : ReserveBufferMode::Manual;
+    plan.reserveOp = reserveOp;
+    plan.addressSpace = as;
+    plan.sizeBytes = sizeBytes;
+    plan.capacityBytes = capacityBytes;
+    plan.alignBytes = spec.alignBytes;
+
+    // Auto mode only declares that one contiguous region must be reserved.
+    // The concrete base is filled later from a hole in the target local space.
+    if (autoAlloc) {
+      if (reserveOp.getBaseAttr()) {
+        return reserveOp.emitOpError(
+            "expects 'base' to be absent when 'auto' is true");
+      }
+      continue;
     }
-    return success();
-  }
 
-  // In manual mode, reserve_buffer.base is already fixed by the frontend or an
-  // earlier stage. Only basic validation is needed here.
-  auto baseAttr = reserveOp.getBaseAttr();
-  if (!baseAttr)
-    return reserveOp.emitOpError("expects 'base' when 'auto' is false");
+    // In manual mode, reserve_buffer.base is already fixed by the frontend or
+    // an earlier stage. Only basic validation is needed here.
+    auto baseAttr = reserveOp.getBaseAttr();
+    if (!baseAttr)
+      return reserveOp.emitOpError("expects 'base' when 'auto' is false");
 
-  int64_t baseBytes = baseAttr.getInt();
-  if (baseBytes % spec.alignBytes != 0) {
-    return reserveOp.emitOpError(
-        "expects 'base' to satisfy the address-space alignment");
-  }
-  if (baseBytes + sizeBytes > capacityBytes) {
-    return reserveOp.emitOpError("exceeds available local memory capacity");
+    int64_t baseBytes = baseAttr.getInt();
+    if (baseBytes % spec.alignBytes != 0) {
+      return reserveOp.emitOpError(
+          "expects 'base' to satisfy the address-space alignment");
+    }
+    if (baseBytes + sizeBytes > capacityBytes) {
+      return reserveOp.emitOpError("exceeds available local memory capacity");
+    }
   }
 
   return success();
@@ -144,19 +283,14 @@ struct OccupiedByteRange {
   int64_t end = 0;
 };
 
-static LogicalResult assignAutoReserveBufferBase(
-    ReserveBufferPlan &plan,
+static LogicalResult assignAutoReserveBufferBases(
+    ReserveBufferPlans &plans,
     const std::map<Value, BufferInfo, ValueComparator> &bufferInfos,
     const DenseMap<Value, SmallVector<uint64_t>> &buffer2Offsets) {
-  if (plan.mode != ReserveBufferMode::Auto || !plan.reserveOp)
-    return success();
-
-  SmallVector<OccupiedByteRange> occupied;
+  std::map<AddressSpace, SmallVector<OccupiedByteRange>> occupiedByAddressSpace;
   for (const auto &it : bufferInfos) {
     Value buffer = it.first;
     const BufferInfo &bufferInfo = it.second;
-    if (bufferInfo.bufferScope != plan.addressSpace)
-      continue;
 
     auto offsetsIt = buffer2Offsets.find(buffer);
     if (offsetsIt == buffer2Offsets.end())
@@ -165,52 +299,71 @@ static LogicalResult assignAutoReserveBufferBase(
     // Reserve-buffer allocation intentionally happens after normal MemPlan.
     // Reconstruct the already occupied byte ranges from the planned local
     // buffers, then place reserve_buffer into the first aligned hole.
-    int64_t occupiedSizeBytes =
-        alignUpBytes(ceilDivBitsToBytes(bufferInfo.constBits), plan.alignBytes);
+    int64_t occupiedSizeBytes = ceilDivBitsToBytes(bufferInfo.constBits);
+    if (bufferInfo.operation) {
+      auto spec = getLocalMemSpec(bufferInfo.operation, bufferInfo.bufferScope);
+      occupiedSizeBytes =
+          alignUpBytes(occupiedSizeBytes, std::max<int64_t>(spec.alignBytes, 1));
+    }
     for (uint64_t offsetBytes : offsetsIt->second) {
-      occupied.push_back(OccupiedByteRange{static_cast<int64_t>(offsetBytes),
-                                           static_cast<int64_t>(offsetBytes) +
-                                               occupiedSizeBytes});
+      occupiedByAddressSpace[bufferInfo.bufferScope].push_back(
+          OccupiedByteRange{static_cast<int64_t>(offsetBytes),
+                            static_cast<int64_t>(offsetBytes) + occupiedSizeBytes});
     }
   }
 
-  llvm::sort(occupied,
-             [](const OccupiedByteRange &lhs, const OccupiedByteRange &rhs) {
-               return lhs.begin < rhs.begin;
-             });
+  auto normalizeRanges = [](SmallVector<OccupiedByteRange> &ranges) {
+    llvm::sort(ranges,
+               [](const OccupiedByteRange &lhs, const OccupiedByteRange &rhs) {
+                 return lhs.begin < rhs.begin;
+               });
 
-  // Merge overlapping or adjacent occupied ranges first so the later scan only
-  // needs to reason about real holes between disjoint intervals.
-  SmallVector<OccupiedByteRange> merged;
-  for (const OccupiedByteRange &range : occupied) {
-    if (merged.empty() || range.begin > merged.back().end) {
-      merged.push_back(range);
+    SmallVector<OccupiedByteRange> merged;
+    for (const OccupiedByteRange &range : ranges) {
+      if (merged.empty() || range.begin > merged.back().end) {
+        merged.push_back(range);
+        continue;
+      }
+      merged.back().end = std::max(merged.back().end, range.end);
+    }
+    ranges.swap(merged);
+  };
+
+  for (auto &it : occupiedByAddressSpace)
+    normalizeRanges(it.second);
+
+  for (ReserveBufferPlan &plan : plans) {
+    if (plan.mode != ReserveBufferMode::Auto || !plan.reserveOp)
       continue;
+
+    SmallVector<OccupiedByteRange> &occupied =
+        occupiedByAddressSpace[plan.addressSpace];
+
+    // First-fit search: try address 0 first, then keep moving the candidate to
+    // the end of the current occupied interval until a large-enough aligned
+    // hole is found.
+    int64_t candidateBase = 0;
+    for (const OccupiedByteRange &range : occupied) {
+      candidateBase = alignUpBytes(candidateBase, plan.alignBytes);
+      if (candidateBase + plan.sizeBytes <= range.begin)
+        break;
+      candidateBase = std::max(candidateBase, range.end);
     }
-    merged.back().end = std::max(merged.back().end, range.end);
-  }
-
-  // First-fit search: try address 0 first, then keep moving the candidate to
-  // the end of the current occupied interval until a large-enough aligned hole
-  // is found.
-  int64_t candidateBase = 0;
-  for (const OccupiedByteRange &range : merged) {
     candidateBase = alignUpBytes(candidateBase, plan.alignBytes);
-    if (candidateBase + plan.sizeBytes <= range.begin)
-      break;
-    candidateBase = std::max(candidateBase, range.end);
-  }
-  candidateBase = alignUpBytes(candidateBase, plan.alignBytes);
+    if (candidateBase + plan.sizeBytes > plan.capacityBytes) {
+      return plan.reserveOp.emitOpError(
+          "failed to allocate local memory hole for reserve_buffer");
+    }
 
-  if (candidateBase + plan.sizeBytes > plan.capacityBytes) {
-    return plan.reserveOp.emitOpError(
-        "failed to allocate local memory hole for reserve_buffer");
+    plan.reserveOp->setAttr(
+        "base",
+        IntegerAttr::get(
+            IntegerType::get(plan.reserveOp.getContext(), kI32BitWidth),
+            candidateBase));
+    occupied.push_back(
+        OccupiedByteRange{candidateBase, candidateBase + plan.sizeBytes});
+    normalizeRanges(occupied);
   }
-
-  plan.reserveOp->setAttr(
-      "base",
-      IntegerAttr::get(IntegerType::get(plan.reserveOp.getContext(), 32),
-                       candidateBase));
   return success();
 }
 
@@ -218,12 +371,12 @@ static LogicalResult assignAutoReserveBufferBase(
 
 void MemLivenessAnalysis::build() {
   Region &funcRegion = func_.getBody();
+  stableValueOrder = buildStableValueOrder(func_);
   Liveness live(func_);
   // Recursively obtaining IR information.
   RecursionIR(&funcRegion, live);
   // the lifetime of the buffer.
   GenerateBufferLife();
-  //InitializeInplacePairList();
 }
 
 bool MemLivenessAnalysis::isLocalMemPlan() const {
@@ -243,6 +396,9 @@ void MemLivenessAnalysis::RecursionIR(Region *region, Liveness live) {
     } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       RecursiveForOp(forOp, live);
       return WalkResult::skip();
+    } else if (auto fusionRegion = dyn_cast<pto::FusionRegionOp>(op)) {
+      RecursiveFusionRegionOp(fusionRegion, live);
+      return WalkResult::skip();
     }
 
     // process operation
@@ -261,9 +417,35 @@ void MemLivenessAnalysis::RecursionIR(Region *region, Liveness live) {
       // of the result as a use of the source in liveness analysis.
       UpdateBufferAlias(bindOp.getResult(), bindOp.getSource());
       return WalkResult::advance();
+    } else if (auto slotOp = dyn_cast<pto::SlotMarkerOp>(op)) {
+      // SlotMarker is metadata-only: it tags which physical slot of a
+      // multi-buffer alloc this view refers to. From the planner's point of
+      // view its result aliases the source; the slot index travels with the
+      // op and is consumed later by PTOResolveBufferSelect / sync.
+      UpdateBufferAlias(slotOp.getResult(), slotOp.getSource());
+      return WalkResult::advance();
     } else if (isLocalMemPlan() && dyn_cast<memref::AllocOp>(op)) {
+      auto allocOp = cast<memref::AllocOp>(op);
       if (failed(CheckLocalBufferAllocOp(op))) {
         return WalkResult::interrupt();
+      }
+      // Pick up the multi-buffer slot count when present. Range checking
+      // mirrors the type-level verifier so a malformed memref alloc (e.g.
+      // from a hand-written test) still gets a clear diagnostic. The
+      // sibling expansion in `ExpandMultiBufferStorageEntry` supports any
+      // N in the legal range.
+      if (auto attr = allocOp->getAttrOfType<IntegerAttr>(
+              mlir::pto::kPtoMultiBufferAttrName)) {
+        uint64_t n = attr.getValue().getZExtValue();
+        if (n < mlir::pto::kPtoMultiBufferMinNum ||
+            n > mlir::pto::kPtoMultiBufferMaxNum) {
+          allocOp.emitError()
+              << "pto.multi_buffer must be in ["
+              << mlir::pto::kPtoMultiBufferMinNum << ", "
+              << mlir::pto::kPtoMultiBufferMaxNum << "] (got " << n << ")";
+          return WalkResult::interrupt();
+        }
+        buffer2MultiNum[allocOp.getResult()] = static_cast<uint32_t>(n);
       }
       UpdateOpBufferInfo(op, op->getResults());
       return WalkResult::advance();
@@ -283,12 +465,27 @@ void MemLivenessAnalysis::RecursionIR(Region *region, Liveness live) {
       // alias/result buffer.
       UpdateOpGenInfo(curOpInfo, ValueRange{op->getOperand(0)});
       OpKillHandle(curOpInfo, live, op->getBlock());
+    } else if (auto getValidShapeOp = dyn_cast<pto::GetValidShapeOp>(op)) {
+      (void)getValidShapeOp;
+      // Metadata-only read from an existing tile handle. It touches the source
+      // buffer for liveness, but the scalar row/col results are not buffers.
+      UpdateOpGenInfo(curOpInfo, ValueRange{op->getOperand(0)});
+      OpKillHandle(curOpInfo, live, op->getBlock());
     } else if (auto storeOp = dyn_cast<memref::StoreOp>(op)) {
       UpdateStoreOpInfo(curOpInfo, storeOp.getMemRef(), live);
     } else if (auto ptoDpsOp = dyn_cast<pto::PTO_DpsInitOpInterface>(op)) {
       // PTO ops with destination (tile_buf, partition_view, etc.); no
       // tensor/memref-only verification.
-      UpdateOpGenInfo(curOpInfo, llvm::to_vector(ptoDpsOp.getDpsInits()));
+      SmallVector<Value> genBuffers = llvm::to_vector(ptoDpsOp.getDpsInits());
+      auto scratchBuffers = getScratchBuffersFromEffects(
+          op, ptoDpsOp.getDpsInits(), stableValueOrder);
+      genBuffers.append(scratchBuffers.begin(), scratchBuffers.end());
+      UpdateOpGenInfo(curOpInfo, genBuffers);
+      for (const auto &conflictPair :
+           getScratchConflictPairsFromEffects(op, ptoDpsOp.getDpsInits(),
+                                              stableValueOrder)) {
+        RecordSemanticConflict(conflictPair.first, conflictPair.second);
+      }
       OpKillHandle(curOpInfo, live, op->getBlock());
     } else if (auto dstStyleOp = dyn_cast<DestinationStyleOpInterface>(op)) {
       // Process the operation of pto instructions as follows:
@@ -305,9 +502,14 @@ void MemLivenessAnalysis::RecursionIR(Region *region, Liveness live) {
     } else if (auto callOp = dyn_cast<func::CallOp>(op)) {
       UpdateOpGenInfo(curOpInfo, llvm::to_vector(callOp->getOperands()));
       OpKillHandle(curOpInfo, live, op->getBlock());
-    } else if (isa<pto::TPushOp, pto::TFreeOp, pto::InitializeL2LPipeOp,
-                   pto::InitializeL2G2LPipeOp, pto::BuildAsyncSessionOp,
-                   pto::TPutAsyncOp, pto::TGetAsyncOp>(op)) {
+    } else if (isa<pto::TAllocOp, pto::TPushOp, pto::TFreeOp,
+                   pto::InitializeL2LPipeOp, pto::InitializeL2G2LPipeOp,
+                   pto::BuildAsyncSessionOp,
+                   pto::TPutAsyncOp, pto::TGetAsyncOp, pto::TPutOp,
+                   pto::TGetOp, pto::TNotifyOp, pto::TWaitOp, pto::TTestOp,
+                   pto::SyncAllOp,
+                   pto::TBroadcastOp, pto::CommTGatherOp,
+                   pto::CommTScatterOp, pto::TReduceOp>(op)) {
       UpdateOpGenInfo(curOpInfo, llvm::to_vector(op->getOperands()));
       OpKillHandle(curOpInfo, live, op->getBlock());
     } else if (auto gpuLaunchOp = dyn_cast<gpu::LaunchFuncOp>(op)) {
@@ -354,14 +556,17 @@ void MemLivenessAnalysis::UpdateForOpBufferAlias(scf::ForOp forOp) {
     return;
   }
   if (!forOp.getRegionIterArgs().empty()) {
-    assert(forOp.getYieldedValues().size() == forOp.getRegionIterArgs().size());
-    assert(forOp.getInitArgs().size() == forOp.getRegionIterArgs().size());
+    if (forOp.getYieldedValues().size() != forOp.getRegionIterArgs().size() ||
+        forOp.getInitArgs().size() != forOp.getRegionIterArgs().size()) {
+      llvm::report_fatal_error("scf.for alias sizes are inconsistent");
+    }
     for (auto [i, arg] : llvm::enumerate(forOp.getRegionIterArgs())) {
       // yielded values alias region iter args.
       UpdateBufferAlias(forOp.getYieldedValues()[i], arg);
     }
   }
-  assert(forOp->getResults().size() == forOp.getYieldedValues().size());
+  if (forOp->getResults().size() != forOp.getYieldedValues().size())
+    llvm::report_fatal_error("scf.for result/yield sizes are inconsistent");
   for (auto [i, arg] : llvm::enumerate(forOp.getYieldedValues())) {
     // forOp result values alias region iter yielded values.
     UpdateBufferAlias(forOp->getResult(i), arg);
@@ -390,7 +595,8 @@ void MemLivenessAnalysis::UpdateForOpInitArgsAlias(scf::ForOp forOp) {
   if (forOp.getInitArgs().empty()) {
     return;
   }
-  assert(forOp.getInitArgs().size() == forOp.getRegionIterArgs().size());
+  if (forOp.getInitArgs().size() != forOp.getRegionIterArgs().size())
+    llvm::report_fatal_error("scf.for init/iter-arg sizes are inconsistent");
   for (auto [i, arg] : llvm::enumerate(forOp.getInitArgs())) {
     // init args alias region iter args.
     UpdateBufferAlias(forOp.getRegionIterArgs()[i], arg);
@@ -402,7 +608,8 @@ void MemLivenessAnalysis::UpdateIfOpBufferAlias(scf::IfOp ifOp,
   if (ifOp.getResults().empty()) {
     return;
   }
-  assert(ifOp->getResults().size() == yieldOp->getOperands().size());
+  if (ifOp->getResults().size() != yieldOp->getOperands().size())
+    llvm::report_fatal_error("scf.if result/yield sizes are inconsistent");
   for (auto [i, arg] : llvm::enumerate(yieldOp->getOperands())) {
     // Multiple buffers involved, requiring one-to-one correspondence.
     UpdateBufferAlias(ifOp->getResult(i), arg);
@@ -415,7 +622,7 @@ void MemLivenessAnalysis::RecursiveIfOp(scf::IfOp ifOp, Liveness live) {
   //        scf.yield %alloc0: memref<16xf16, #pto.address_space<ub>>
   //      else:
   //        scf.yield %alloc1 : memref<16xf16, #pto.address_space<ub>>
-  auto curIfThen = UpdateLinearOperation(ifOp.getOperation());
+  UpdateLinearOperation(ifOp.getOperation());
   RecursionIR(&ifOp.getThenRegion(), live);
   auto curIfElse = UpdateLinearOperation(ifOp.getOperation());
   UpdateIfOpBufferAlias(ifOp, ifOp.thenYield());
@@ -427,6 +634,34 @@ void MemLivenessAnalysis::RecursiveIfOp(scf::IfOp ifOp, Liveness live) {
     UpdateIfOpBufferAlias(ifOp, ifOp.elseYield());
   }
   OpKillHandle(curIfEnd, live, ifOp->getBlock());
+}
+
+void MemLivenessAnalysis::UpdateFusionRegionBufferAlias(
+    pto::FusionRegionOp fusionRegion, pto::YieldOp yieldOp) {
+  if (fusionRegion.getResults().empty())
+    return;
+  if (fusionRegion->getResults().size() != yieldOp->getOperands().size()) {
+    llvm::report_fatal_error(
+        "pto.fusion_region result/yield sizes are inconsistent");
+  }
+  for (auto [i, yielded] : llvm::enumerate(yieldOp->getOperands())) {
+    UpdateBufferAlias(fusionRegion->getResult(i), yielded);
+  }
+}
+
+void MemLivenessAnalysis::RecursiveFusionRegionOp(pto::FusionRegionOp fusionRegion,
+                                                  Liveness live) {
+  UpdateLinearOperation(fusionRegion.getOperation());
+  RecursionIR(&fusionRegion.getBody(), live);
+
+  auto yieldOp =
+      dyn_cast<pto::YieldOp>(fusionRegion.getBody().front().getTerminator());
+  if (!yieldOp)
+    llvm::report_fatal_error("pto.fusion_region must terminate with pto.yield");
+  UpdateFusionRegionBufferAlias(fusionRegion, yieldOp);
+
+  auto regionEnd = UpdateLinearOperation(fusionRegion.getOperation());
+  OpKillHandle(regionEnd, live, fusionRegion->getBlock());
 }
 
 SmallVector<Value> MemLivenessAnalysis::GetLiveBuffersInLoop(scf::ForOp forOp,
@@ -452,13 +687,15 @@ SmallVector<Value> MemLivenessAnalysis::GetLiveBuffersInLoop(scf::ForOp forOp,
         allocBeforeLoopBuffers.push_back(Buffer);
     }
   }
+  sortValuesByStableOrder(allocBeforeLoopBuffers, stableValueOrder);
   return allocBeforeLoopBuffers;
 }
 
 LogicalResult
 MemLivenessAnalysis::CheckLocalBufferAllocOp(Operation *op) const {
   auto allocOp = dyn_cast<memref::AllocOp>(op);
-  assert(allocOp && "must be alloc op");
+  if (!allocOp)
+    return op->emitError("must be alloc op"), failure();
   auto memorySpaceAttr = GetBufferSpaceAttr(allocOp.getResult());
   if (isLocalBuffer(memorySpaceAttr)) {
     return success();
@@ -470,7 +707,16 @@ MemLivenessAnalysis::CheckLocalBufferAllocOp(Operation *op) const {
 bool MemLivenessAnalysis::isSkippableOp(Operation *op) const {
   // Call-like ops are still modeled explicitly. Only pure terminators and
   // dim queries are skipped here.
-  return isa<func::ReturnOp, scf::YieldOp, memref::DimOp>(op);
+  //
+  // `pto.slot_marker` is a metadata-only view added by PTOViewToMemref to
+  // thread multi-buffer slot selection through the memref layer. Until
+  // PlanMemory acquires first-class multi-buffer support (the design's
+  // §5.2 work), treat it as a passthrough so the rest of the pipeline can
+  // still be exercised. The N-way physical fan-out lives on the
+  // `pto.multi_buffer` attr of the underlying `memref.alloc` and is a
+  // follow-up.
+  return isa<func::ReturnOp, scf::YieldOp, pto::YieldOp, memref::DimOp,
+             mlir::pto::SlotMarkerOp>(op);
 }
 
 LogicalResult
@@ -523,6 +769,9 @@ SetVector<Value> MemLivenessAnalysis::Union(SetVector<Value> set1,
 }
 
 SetVector<Value> MemLivenessAnalysis::GetAliasBuffers(Value aliasBuffer) {
+  if (!aliasBuffer)
+    return {};
+
   auto trueVar = buffer2AliasVec.find(aliasBuffer);
   if (trueVar != buffer2AliasVec.end()) {
     return trueVar->second;
@@ -588,8 +837,9 @@ void MemLivenessAnalysis::OpKillHandle(OpInfo *opInfo, Liveness live,
   if (currentLiveValues.empty()) {
     return;
   }
-  SetVector<Value> liveValues(currentLiveValues.begin(),
-                              currentLiveValues.end());
+  SmallVector<Value> liveValues(currentLiveValues.begin(),
+                                currentLiveValues.end());
+  sortValuesByStableOrder(liveValues, stableValueOrder);
   for (const Value &operand : liveValues) {
     UpdateOpKillInfo(opInfo, operand, live);
   }
@@ -626,11 +876,31 @@ bool MemLivenessAnalysis::AllDeadAfter(Operation *op, SetVector<Value> aliasVec,
   return true;
 }
 
+void MemLivenessAnalysis::RecordSemanticConflict(Value lhs, Value rhs) {
+  SetVector<Value> lhsAliases = GetAliasBuffers(lhs);
+  lhsAliases.insert(lhs);
+  SetVector<Value> rhsAliases = GetAliasBuffers(rhs);
+  rhsAliases.insert(rhs);
+
+  auto appendUniquePair = [&](Value a, Value b) {
+    if (!a || !b || a == b)
+      return;
+    ValuePair pair = isLessValue(a, b) ? ValuePair(a, b) : ValuePair(b, a);
+    if (!llvm::is_contained(semanticConflictPairs, pair))
+      semanticConflictPairs.push_back(pair);
+  };
+
+  for (Value a : lhsAliases)
+    for (Value b : rhsAliases)
+      appendUniquePair(a, b);
+}
+
 BufferInfo MemLivenessAnalysis::GenerateBufferInfo(Operation *op,
                                                    Value operand) {
   auto memorySpaceAttr = GetBufferSpaceAttr(operand);
   if (isLocalMemPlan() && isLocalBuffer(memorySpaceAttr)) {
-    assert(memorySpaceAttr.has_value() && "buffer must has space!");
+    if (!memorySpaceAttr.has_value())
+      llvm::report_fatal_error("local buffer must have memory space");
     return GetBufferInfo(op, operand,
                          memorySpaceAttr.value().getAddressSpace());
   }
@@ -648,11 +918,14 @@ BufferInfo MemLivenessAnalysis::GetBufferInfo(Operation *op, Value operand,
   bufferInfo.bufferType = memRefType.getElementType();
   std::optional<int64_t> totalStaticSize =
       getStaticTotalSize(memRefType.getShape());
-  assert(totalStaticSize.has_value() &&
-         "Failed to obtain op buffer shape size!");
+  if (!totalStaticSize.has_value())
+    llvm::report_fatal_error("failed to obtain buffer static shape size");
+  unsigned elemBytes = getPTOStorageElemByteSize(memRefType.getElementType());
+  if (elemBytes == 0)
+    llvm::report_fatal_error("failed to obtain buffer element byte size");
   bufferInfo.constBits =
       totalStaticSize.value() *
-      static_cast<int64_t>(memRefType.getElementTypeBitWidth());
+      static_cast<int64_t>(elemBytes * kBitsPerByte);
   return bufferInfo;
 }
 
@@ -674,8 +947,8 @@ void MemLivenessAnalysis::GenerateBufferLife() {
     // Time given to buffer end.
     for (const Value &killBuffer : it->second.kill) {
       auto iter = buffer2Life.find(killBuffer);
-      assert(iter != buffer2Life.end() &&
-             "buffer has not been generated before! ");
+      if (iter == buffer2Life.end())
+        llvm::report_fatal_error("buffer lifetime killed before generation");
       iter->second->freeTime = scopeTime;
     }
     scopeTime++;
@@ -715,17 +988,24 @@ SmallVector<ValuePair> MemPlan::GenerateInplaceList() {
     if (hasTouchOp[operationSeq->operation]) {
       continue;
     }
-    for (const Value &genBuffer : it->second.gen) {
+
+    SmallVector<Value> genBuffers(it->second.gen.begin(), it->second.gen.end());
+    SmallVector<Value> killBuffers(it->second.kill.begin(), it->second.kill.end());
+    sortValuesByStableOrder(genBuffers, stableValueOrder);
+    sortValuesByStableOrder(killBuffers, stableValueOrder);
+
+    for (const Value &genBuffer : genBuffers) {
       auto genBufferIter = bufferInfos.find(genBuffer);
-      assert(genBufferIter != bufferInfos.end() &&
-             "genBuffer should be find in bufferInfos");
+      if (genBufferIter == bufferInfos.end())
+        llvm::report_fatal_error("gen buffer missing from buffer info map");
       if (genBufferIter->second.ignoreInplace) {
         continue;
       }
-      for (const Value &killBuffer : it->second.kill) {
+
+      for (const Value &killBuffer : killBuffers) {
         auto killBufferIter = bufferInfos.find(killBuffer);
-        assert(killBufferIter != bufferInfos.end() &&
-               "killBuffer should be find in bufferInfos");
+        if (killBufferIter == bufferInfos.end())
+          llvm::report_fatal_error("kill buffer missing from buffer info map");
         if (killBufferIter->second.ignoreInplace) {
           continue;
         }
@@ -788,6 +1068,31 @@ bool MemPlan::RecordOverflowIfAny() {
   return !failApplyBufferInfo.empty();
 }
 
+bool MemPlan::HasSemanticConflict(const StorageEntry *entry,
+                                  const BufferLifeVec &bufferLives) const {
+  if (!entry || semanticConflictPairs.empty() || bufferLives.empty())
+    return false;
+
+  auto containsPair = [&](Value lhs, Value rhs) {
+    ValuePair pair = isLessValue(lhs, rhs) ? ValuePair(lhs, rhs)
+                                           : ValuePair(rhs, lhs);
+    return llvm::is_contained(semanticConflictPairs, pair);
+  };
+
+  for (Value entryBuffer : entry->inplaceBuffers) {
+    for (const auto &life : bufferLives) {
+      if (!life)
+        continue;
+      Value otherBuffer = life->buffer;
+      if (!otherBuffer || entryBuffer == otherBuffer)
+        continue;
+      if (containsPair(entryBuffer, otherBuffer))
+        return true;
+    }
+  }
+  return false;
+}
+
 // Plan Memory algorithm.
 LogicalResult MemPlan::plan() {
   // Construct StorageEntry structure.
@@ -804,6 +1109,47 @@ LogicalResult MemPlan::plan() {
     EmitPlanMemoryFailureInfo();
     return failure();
   }
+  auto hasAddressOverlap = [](const StorageEntry *lhs, const StorageEntry *rhs) {
+    uint64_t lhsBegin = lhs->bitsOffset;
+    uint64_t lhsEnd = lhs->bitsOffset + lhs->alignedConstBits;
+    uint64_t rhsBegin = rhs->bitsOffset;
+    uint64_t rhsEnd = rhs->bitsOffset + rhs->alignedConstBits;
+    return lhsBegin < rhsEnd && rhsBegin < lhsEnd;
+  };
+  SmallVector<const StorageEntry *> plannedEntries;
+  plannedEntries.reserve(StorageEntryVec.size() + pingEntry2RelationPongEntry.size());
+  for (const auto &entry : StorageEntryVec) {
+    plannedEntries.push_back(entry.get());
+  }
+  for (const auto &entry : pingEntry2RelationPongEntry) {
+    plannedEntries.push_back(entry.second.get());
+  }
+  for (size_t i = 0; i < plannedEntries.size(); ++i) {
+    for (size_t j = i + 1; j < plannedEntries.size(); ++j) {
+      const StorageEntry *lhs = plannedEntries[i];
+      const StorageEntry *rhs = plannedEntries[j];
+      if (!lhs || !rhs) {
+        continue;
+      }
+      if (lhs->bufInfo->bufferScope != rhs->bufInfo->bufferScope) {
+        continue;
+      }
+      if (!hasAddressOverlap(lhs, rhs)) {
+        continue;
+      }
+      bool lifeOverlap =
+          !GetOverlapBufferLife(lhs->bufferLifeVec, rhs->bufferLifeVec).empty();
+      bool semanticConflict = HasSemanticConflict(lhs, rhs->bufferLifeVec);
+      if (!lifeOverlap && !semanticConflict) {
+        continue;
+      }
+      func_.emitError()
+          << "PlanMemory produced overlapping local buffers in "
+          << stringifyEnum(lhs->bufInfo->bufferScope)
+          << " at offsets " << lhs->bitsOffset << " and " << rhs->bitsOffset;
+      return failure();
+    }
+  }
   // Update the address information of each buffer after memory buffer.
   UpdateBuffer2Offsets();
   if (enablePrintMemoryAllocatedSize) {
@@ -818,7 +1164,9 @@ void MemPlan::GenerateStorageEntry() {
     auto it = genKillMap.find(operation.get());
     if (it == genKillMap.end())
       continue;
-    for (const Value &genBuffer : it->second.gen) {
+    SmallVector<Value> genBuffers(it->second.gen.begin(), it->second.gen.end());
+    sortValuesByStableOrder(genBuffers, stableValueOrder);
+    for (const Value &genBuffer : genBuffers) {
       auto iter = bufferInfos.find(genBuffer);
       if (iter == bufferInfos.end()) {
         continue;
@@ -843,7 +1191,8 @@ void MemPlan::GenerateStorageEntry() {
 void MemPlan::PrintSuccessfulAllocatedMaxBits() {
   auto it = memscope2rootStorageEntry.find(pto::AddressSpace::VEC);
   if (it != memscope2rootStorageEntry.end()) {
-    assert(it->second != nullptr);
+    if (!it->second)
+      llvm::report_fatal_error("missing root storage entry for VEC scope");
     uint64_t ubAllocBits = it->second->alignedConstBits + it->second->bitsOffset;
     for (auto& child : it->second->mergedChildren) {
       ubAllocBits = std::max(ubAllocBits, child->bitsOffset + child->alignedConstBits);
@@ -854,17 +1203,34 @@ void MemPlan::PrintSuccessfulAllocatedMaxBits() {
 }
 
 void MemPlan::ValidateParameters(std::unique_ptr<StorageEntry> &e) const {
-  assert(e->bufInfo->operation && "Unrecognized legal define operation !");
-  assert(e->bufInfo->constBits >= 0U && "recognized illegal memory sizes !");
-  assert(!e->bufferLifeVec.empty() && "Unrecognized buffer's life time !");
+  if (!e->bufInfo->operation)
+    llvm::report_fatal_error("storage entry missing defining operation");
+  if (e->bufInfo->constBits < 0U)
+    llvm::report_fatal_error("storage entry has invalid memory size");
+  if (e->bufferLifeVec.empty())
+    llvm::report_fatal_error("storage entry missing lifetime information");
 }
 
 void MemPlan::UpdateBuffer2Offsets() {
   for (auto &e : StorageEntryVec) {
+    // Skip sibling (slot >= 1) entries -- their offsets are written via the
+    // primary entry's `relationOtherBuffers` traversal below. Without this
+    // skip the sibling offsets would be appended in StorageEntryVec order
+    // rather than slot order, breaking the runtime contract that
+    // `buffer2Offsets[buffer][k]` is slot k's physical offset.
+    if (e->isMultiBufferSlot)
+      continue;
     for (Value &buffer : e->inplaceBuffers) {
-      // MultiBuffer can cause multiple addrs.
       buffer2Offsets[buffer].push_back(
           (e->bitsOffset + kBitsToByte - 1) / kBitsToByte);
+      // Multi-buffer primary: append sibling offsets in slot order so the
+      // final offsets list is [slot0, slot1, ..., slotN-1].
+      for (auto *sibling : e->relationOtherBuffers) {
+        if (!sibling)
+          continue;
+        buffer2Offsets[buffer].push_back(
+            (sibling->bitsOffset + kBitsToByte - 1) / kBitsToByte);
+      }
     }
   }
   // In the MultiBuffer scenario, single reuse db will result in additional
@@ -898,8 +1264,8 @@ void MemPlan::MergeInplaceSE() {
       // already same storageEntry, no need to inplace.
       continue;
     }
-    assert(genSE != nullptr && killSE != nullptr &&
-           " genSE and killSE should be valid");
+    if (genSE == nullptr || killSE == nullptr)
+      llvm::report_fatal_error("invalid storage entry during inplace merge");
     BufferLifeVec mergedBufferLifeVec;
     mergedBufferLifeVec.insert(mergedBufferLifeVec.end(),
                                genSE->bufferLifeVec.begin(),
@@ -993,20 +1359,31 @@ void MemPlan::GlobalWorkspaceNoReuse(StorageEntry *rootStorageEntry) {
 }
 
 void MemPlan::ExpandMultiBufferStorageEntry() {
-  // StorageEntry that needs to be expanded.
+  // For each multi-buffer primary entry, create (N - 1) sibling entries so
+  // the planner can lay out one physical slot per sibling. Siblings are
+  // pushed into `StorageEntryVec` and participate in normal Stage0/Stage2
+  // address allocation. The primary keeps `relationOtherBuffers` pointing
+  // at the siblings in slot order (slot 1..N-1), and `relationPongEntry`
+  // aliases the first sibling so existing N == 2 codepaths keep working.
   size_t size = StorageEntryVec.size();
   for (size_t i = 0; i < size; i++) {
-    if (StorageEntryVec[i]->multiBufferNum > 1) {
-      std::unique_ptr<StorageEntry> entry = std::make_unique<StorageEntry>();
-      entry->bufInfo = StorageEntryVec[i]->bufInfo;
-      entry->bufferLifeVec = StorageEntryVec[i]->bufferLifeVec;
-      entry->alignedConstBits = StorageEntryVec[i]->alignedConstBits;
-      entry->inplaceBuffers = StorageEntryVec[i]->inplaceBuffers;
-      entry->multiBufferNum = StorageEntryVec[i]->multiBufferNum;
-      // Ping saves information related to Pong.
-      StorageEntryVec[i]->relationPongEntry = entry.get();
+    auto *primary = StorageEntryVec[i].get();
+    if (primary->multiBufferNum <= 1)
+      continue;
+    uint32_t n = primary->multiBufferNum;
+    for (uint32_t slot = 1; slot < n; ++slot) {
+      auto entry = std::make_unique<StorageEntry>();
+      entry->bufInfo = primary->bufInfo;
+      entry->bufferLifeVec = primary->bufferLifeVec;
+      entry->alignedConstBits = primary->alignedConstBits;
+      entry->inplaceBuffers = primary->inplaceBuffers;
+      entry->multiBufferNum = n;
+      entry->isMultiBufferSlot = true;
+      primary->relationOtherBuffers.push_back(entry.get());
       StorageEntryVec.push_back(std::move(entry));
     }
+    if (!primary->relationOtherBuffers.empty())
+      primary->relationPongEntry = primary->relationOtherBuffers.front();
   }
 }
 
@@ -1015,7 +1392,8 @@ bool MemPlan::IsEnoughForBuffersNoReuse(StorageEntry *rootStorageEntry,
                                         size_t alignUnit) {
   auto iter =
       bufferScope2RequiredSize.find(rootStorageEntry->bufInfo->bufferScope);
-  assert(iter != bufferScope2RequiredSize.end());
+  if (iter == bufferScope2RequiredSize.end())
+    llvm::report_fatal_error("missing required-size entry for buffer scope");
   if (iter->second < restBufferSize) {
     PlanBuffersWithoutReuse(rootStorageEntry, alignUnit);
     return true;
@@ -1114,73 +1492,83 @@ PlanStatus MemPlan::PlanMemAddressOfWholeLocalBuffer() {
     size_t align = bufferSpaceInfo.first;
     size_t maxBits = bufferSpaceInfo.second;
     if (rootStorageEntry->mergedChildren.empty()) {
-      // Only one buffer needs to be allocated within the same scope, allocate
-      // directly.
-      uint64_t needAlignedBits =
-          AlignUp(rootStorageEntry->bufInfo->constBits, align);
-      if (needAlignedBits > maxBits) {
-        failApplyBufferInfo[rootStorageEntry->bufInfo->bufferScope] =
-            needAlignedBits;
-        return PlanStatus::PLAN_FAILED;
-      }
-      rootStorageEntry->bitsOffset = 0;
-      rootStorageEntry->alignedConstBits = needAlignedBits;
+      PlanStatus status = PlanSingleLocalBuffer(rootStorageEntry, align, maxBits);
+      if (status != PlanStatus::PLAN_SUCCESS)
+        return status;
       continue;
     }
     if (IsEnoughForBuffersNoReuse(rootStorageEntry, maxBits, align)) {
       continue;
     }
-    rootStorageEntry = GetReorderRootStorageEntry(rootStorageEntry);
-    ReportMemLifeDebugInfo(rootStorageEntry);
-    // memory outline in a given buffer scope.
-    MemBoundList outline;
-    PlanRecHis history;
-    SpecInfo si;
-    si.specLevel = si.maxLevel;
-    int childrenNum = static_cast<int>(rootStorageEntry->mergedChildren.size());
-    outline.push_back(
-        std::make_shared<MemoryBound>(BufferLifeVec(), 0, maxBits, nullptr));
-
-    // The initial value is rootStorageEntry.
-    StorageEntry *curEntry = rootStorageEntry;
-    while (si.childIdx < childrenNum) {
-      uint64_t needBits = static_cast<uint64_t>(curEntry->bufInfo->constBits);
-      curEntry->alignedConstBits = AlignUp(needBits, align);
-      curEntry->childIdx = si.childIdx;
-      LDBG("\n");
-      LDBG("----------Need-Plan-CurEntry---------\n");
-      ReportCurEntryDebugInfo(curEntry);
-      LDBG("\n");
-      LogicalResult planResult = MultiSpecPlan(si, outline, history, curEntry);
-      if (failed(planResult)) {
-        StatusWrapper statusWrapper = {false,   curEntry->alignedConstBits,
-                                       &si,     outline,
-                                       history, rootStorageEntry};
-        LDBG("\n");
-        LDBG("----------ApplyFailStrategy---------\n");
-        ReportCurEntryDebugInfo(curEntry);
-        LDBG("\n");
-        PlanStatus as = ApplyFailStrategy(statusWrapper, maxBits);
-        if (as == PlanStatus::RESTART_NEW_PLAN) {
-          // Restart plan.
-          si = SpecInfo();
-          curEntry = rootStorageEntry;
-          continue;
-        }
-        if (as == PlanStatus::PLAN_FAILED) {
-          ReportAllocatedEntryDebugInfo(rootStorageEntry);
-          PlanMemAddressForLevel0(rootStorageEntry);
-          return as;
-        }
-      }
-      if (si.childIdx >= childrenNum) {
-        break;
-      }
-      curEntry = rootStorageEntry->mergedChildren[si.childIdx];
-    }
+    PlanStatus status = PlanReusableLocalBuffer(rootStorageEntry, align, maxBits);
+    if (status != PlanStatus::PLAN_SUCCESS)
+      return status;
   }
   planStatus = PlanStatus::PLAN_SUCCESS;
   return planStatus;
+}
+
+PlanStatus MemPlan::PlanSingleLocalBuffer(StorageEntry *rootStorageEntry,
+                                          size_t align, size_t maxBits) {
+  uint64_t needAlignedBits = AlignUp(rootStorageEntry->bufInfo->constBits, align);
+  if (needAlignedBits > maxBits) {
+    failApplyBufferInfo[rootStorageEntry->bufInfo->bufferScope] =
+        needAlignedBits;
+    return PlanStatus::PLAN_FAILED;
+  }
+  rootStorageEntry->bitsOffset = 0;
+  rootStorageEntry->alignedConstBits = needAlignedBits;
+  return PlanStatus::PLAN_SUCCESS;
+}
+
+PlanStatus MemPlan::PlanReusableLocalBuffer(StorageEntry *rootStorageEntry,
+                                            size_t align, size_t maxBits) {
+  rootStorageEntry = GetReorderRootStorageEntry(rootStorageEntry);
+  ReportMemLifeDebugInfo(rootStorageEntry);
+
+  MemBoundList outline;
+  PlanRecHis history;
+  SpecInfo si;
+  si.specLevel = si.maxLevel;
+  int childrenNum = static_cast<int>(rootStorageEntry->mergedChildren.size());
+  outline.push_back(
+      std::make_shared<MemoryBound>(BufferLifeVec(), 0, maxBits, nullptr));
+
+  StorageEntry *curEntry = rootStorageEntry;
+  while (si.childIdx < childrenNum) {
+    uint64_t needBits = static_cast<uint64_t>(curEntry->bufInfo->constBits);
+    curEntry->alignedConstBits = AlignUp(needBits, align);
+    curEntry->childIdx = si.childIdx;
+    LDBG("\n");
+    LDBG("----------Need-Plan-CurEntry---------\n");
+    ReportCurEntryDebugInfo(curEntry);
+    LDBG("\n");
+    LogicalResult planResult = MultiSpecPlan(si, outline, history, curEntry);
+    if (failed(planResult)) {
+      StatusWrapper statusWrapper = {false,   curEntry->alignedConstBits,
+                                     &si,     outline,
+                                     history, rootStorageEntry};
+      LDBG("\n");
+      LDBG("----------ApplyFailStrategy---------\n");
+      ReportCurEntryDebugInfo(curEntry);
+      LDBG("\n");
+      PlanStatus status = ApplyFailStrategy(statusWrapper, maxBits);
+      if (status == PlanStatus::RESTART_NEW_PLAN) {
+        si = SpecInfo();
+        curEntry = rootStorageEntry;
+        continue;
+      }
+      if (status == PlanStatus::PLAN_FAILED) {
+        ReportAllocatedEntryDebugInfo(rootStorageEntry);
+        PlanMemAddressForLevel0(rootStorageEntry);
+        return status;
+      }
+    }
+    if (si.childIdx >= childrenNum)
+      break;
+    curEntry = rootStorageEntry->mergedChildren[si.childIdx];
+  }
+  return PlanStatus::PLAN_SUCCESS;
 }
 
 void MemPlan::ReportMemLifeDebugInfo(StorageEntry *rootStorageEntry) {
@@ -1200,6 +1588,7 @@ void MemPlan::MemLifeDebugInfo(StorageEntry *storageEntry) {
     }
   }
   for (auto &bufferLife : storageEntry->bufferLifeVec) {
+    (void)bufferLife;
     LDBG("bufferLife : "
          << "allocTime : " << bufferLife->allocTime
          << " , freeTime : " << bufferLife->freeTime << "\n");
@@ -1278,7 +1667,7 @@ void MemPlan::ReorderContinuousPingPongEntry(
                         reorderedStorageEntryVec.end(), storageEntry);
     if (it == reorderedStorageEntryVec.end()) {
       reorderedStorageEntryVec.push_back(storageEntry);
-      if (storageEntry->multiBufferNum == 2 &&
+      if (storageEntry->multiBufferNum == kDoubleBufferCount &&
           storageEntry->relationPongEntry) {
         // Ping Pong continuous save.
         reorderedStorageEntryVec.push_back(storageEntry->relationPongEntry);
@@ -1292,21 +1681,29 @@ std::pair<size_t, size_t>
 MemPlan::GetBufferSpaceInfo(pto::AddressSpace &space) const {
   switch (space) {
   case pto::AddressSpace::VEC:
-    return std::make_pair(ubAlignSize, ubSpaceSize);
+    return std::make_pair(plannerAlignBitsFromBytes(ubAlignSize), ubSpaceSize);
   case pto::AddressSpace::MAT:
-    return std::make_pair(l1AlignSize, l1SpaceSize);
+    return std::make_pair(plannerAlignBitsFromBytes(l1AlignSize), l1SpaceSize);
   case pto::AddressSpace::ACC:
-    return std::make_pair(l0cAlignSize, l0cSpaceSize);
+    return std::make_pair(plannerAlignBitsFromBytes(l0cAlignSize),
+                          l0cSpaceSize);
   case pto::AddressSpace::LEFT:
-    return std::make_pair(l0aAlignSize, l0aSpaceSize);
+    return std::make_pair(plannerAlignBitsFromBytes(l0aAlignSize),
+                          l0aSpaceSize);
   case pto::AddressSpace::RIGHT:
-    return std::make_pair(l0bAlignSize, l0bSpaceSize);
+    return std::make_pair(plannerAlignBitsFromBytes(l0bAlignSize),
+                          l0bSpaceSize);
   case pto::AddressSpace::BIAS:
-    return std::make_pair(biasAlignSize, biasSpaceSize);
+    return std::make_pair(plannerAlignBitsFromBytes(biasAlignSize),
+                          biasSpaceSize);
   case pto::AddressSpace::SCALING:
-    return std::make_pair(scalingAlignSize, scalingSpaceSize);
+    return std::make_pair(plannerAlignBitsFromBytes(scalingAlignSize),
+                          scalingSpaceSize);
+  case pto::AddressSpace::Zero:
+  case pto::AddressSpace::GM:
+    return std::make_pair(size_t{0}, size_t{0});
   }
-  
+
   llvm_unreachable("Temporarily unsupported memory buffer space !");
 }
 
@@ -1394,7 +1791,8 @@ MemPlan::GetBufferParentLoop(const SmallVector<Value> &buffers) {
   llvm::SmallSet<LoopLikeOpInterface, 1> parentLoopVec;
   for (auto buffer : buffers) {
     if (!buffer.getDefiningOp()) {
-      assert(isa<scf::ForOp>(buffer.getParentBlock()->getParentOp()));
+      if (!isa<scf::ForOp>(buffer.getParentBlock()->getParentOp()))
+        llvm::report_fatal_error("expected loop-carried block argument");
       // Init args and region iter arg are inplace, ignore Region Iter Arg
       // without DefineOp.
       continue;
@@ -1428,8 +1826,8 @@ bool MemPlan::VerifyConflictStage1(MemBoundList &outline, PlanRecHis &his,
   StorageEntry *multiRelationPongEntry =
       GetMultiRelationPongEntry(reuseBoundStorageEntry);
   if (multiRelationPongEntry) {
-    if (e->multiBufferNum == 1 ||
-        (e->multiBufferNum == 2 && e->relationPongEntry &&
+    if (e->multiBufferNum == kSingleBufferCount ||
+        (e->multiBufferNum == kDoubleBufferCount && e->relationPongEntry &&
          (e->relationPongEntry->bitsOffset != 0))) {
       auto parentLoop1 = GetBufferParentLoop(e->inplaceBuffers);
       auto parentLoop2 =
@@ -1457,7 +1855,7 @@ bool MemPlan::VerifyConflictStage1(MemBoundList &outline, PlanRecHis &his,
 
 StorageEntry *
 MemPlan::GetMultiRelationPongEntry(const StorageEntry *reuseBoundStorageEntry) {
-  if (reuseBoundStorageEntry->multiBufferNum == 2 &&
+  if (reuseBoundStorageEntry->multiBufferNum == kDoubleBufferCount &&
       reuseBoundStorageEntry->relationPongEntry &&
       (reuseBoundStorageEntry->relationPongEntry->bitsOffset != 0)) {
     // If the reuseBoundStorageEntry itself requires db, directly match and
@@ -1493,10 +1891,11 @@ void MemPlan::SpecAllocRelationPongEntry(MemBoundList &outline, PlanRecHis &his,
       if (iter != pingEntry2RelationPongEntry.end()) {
         pongStorageEntry = iter->second.get();
       }
-      if (e->multiBufferNum == 2 && e->relationPongEntry) {
+      if (e->multiBufferNum == kDoubleBufferCount && e->relationPongEntry) {
         pongStorageEntry = e->relationPongEntry;
       }
-      assert(pongStorageEntry && "PongStorage Entry not found!");
+      if (!pongStorageEntry)
+        llvm::report_fatal_error("pong storage entry not found");
       UpdateOutline(outline, his, pongStorageEntry,
                     OutlineSectionInfo(start, end, size, true), SPEC_LEVEL_1);
       return;
@@ -1508,6 +1907,8 @@ bool MemPlan::IsBufferLifeVecConflict(PlanRecord &r, uint64_t offset,
                                       const StorageEntry *e) const {
   if ((r.firstMemBound->offset + r.allExtent > offset) &&
       (r.firstMemBound->offset < offset + e->alignedConstBits)) {
+    if (HasSemanticConflict(e, r.firstMemBound->bufferLifeVec))
+      return true;
     DenseMap<ValuePair, BufferLife> intersection =
         GetOverlapBufferLife(r.entry->bufferLifeVec, e->bufferLifeVec);
     return !intersection.empty();
@@ -1516,7 +1917,7 @@ bool MemPlan::IsBufferLifeVecConflict(PlanRecord &r, uint64_t offset,
 }
 
 void MemPlan::PlanRelationPongEntryAddress(uint64_t offset, StorageEntry *e) {
-  if (e->multiBufferNum == 1) {
+  if (e->multiBufferNum == kSingleBufferCount) {
     std::unique_ptr<StorageEntry> entry = std::make_unique<StorageEntry>();
     entry->bufInfo = e->bufInfo;
     entry->bufferLifeVec = e->bufferLifeVec;
@@ -1525,11 +1926,15 @@ void MemPlan::PlanRelationPongEntryAddress(uint64_t offset, StorageEntry *e) {
     entry->multiBufferNum = e->multiBufferNum;
     entry->bitsOffset = offset;
     pingEntry2RelationPongEntry[e] = std::move(entry);
-  } else if (e->multiBufferNum == 2) {
+  } else if (e->multiBufferNum == kDoubleBufferCount) {
     e->relationPongEntry->bitsOffset = offset;
-  } else {
-    llvm_unreachable("Does not support multi buffer num greater than 2 !");
   }
+  // N > 2: the Stage1 "place ping next to a free pong slot" optimization is
+  // not modeled for the general N-way case in this release. Sibling entries
+  // get their own addresses via the normal Stage0/Stage2 paths in
+  // `PlanReusableLocalBuffer` / `PlanSingleLocalBuffer`. This branch is a
+  // no-op rather than an unreachable so the planner can keep making forward
+  // progress on N > 2 inputs.
 }
 
 bool MemPlan::VerifyConflictStage2(PlanRecHis &his, const StorageEntry *e,
@@ -1720,6 +2125,8 @@ bool MemPlan::IsSamePlanAsLastRollBack(uint64_t allocOffset, int curChildIdx,
 inline bool
 MemPlan::VerifyConflictStage0(StorageEntry *e,
                               const std::shared_ptr<MemoryBound> &last) {
+  if (HasSemanticConflict(e, last->bufferLifeVec))
+    return true;
   // level_0: offset = 0, offset means life distance
   DenseMap<ValuePair, BufferLife> intersection =
       GetOverlapBufferLife(e->bufferLifeVec, last->bufferLifeVec);
@@ -1796,11 +2203,14 @@ void MemPlan::ReportAllocatedEntryDebugInfo(StorageEntry *rootStorageEntry) {
         (entry->alignedConstBits + kBitsToByte - 1) / kBitsToByte;
     uint64_t offsetByte =
         (entry->bitsOffset + kBitsToByte - 1) / kBitsToByte;
+    (void)needByte;
+    (void)offsetByte;
     ReportCurEntryDebugInfo(entry);
     LDBG(", offset: " << offsetByte);
     LDBG(", extent: " << needByte);
     LDBG(", buffer life: ");
     for (auto &bufferLife : entry->bufferLifeVec) {
+      (void)bufferLife;
       LDBG("[" << bufferLife->allocTime << "-" << bufferLife->freeTime
                << "], ");
     }
@@ -1817,7 +2227,8 @@ void MemPlan::ReportAllocatedEntryDebugInfo(StorageEntry *rootStorageEntry) {
       LDBG("\n");
     }
     size_t num = allocatedEntry.size() - 1;
-    assert(rootStorageEntry->mergedChildren.size() > num);
+    if (rootStorageEntry->mergedChildren.size() <= num)
+      llvm::report_fatal_error("missing failed storage entry");
     const StorageEntry *failedSe = rootStorageEntry->mergedChildren[num];
     printRecord(failedSe);
     LDBG("alloc fail,because exceed bound of memory \n"
@@ -1910,7 +2321,8 @@ void MemPlan::RollBackForAllocFailInner(StatusWrapper &statusWrapper,
       pingEntry2RelationPongEntry.erase(iter);
     }
     if (r.isDirectlyRollback ||
-        (r.entry->multiBufferNum == 2 && !r.entry->relationPongEntry)) {
+        (r.entry->multiBufferNum == kDoubleBufferCount &&
+         !r.entry->relationPongEntry)) {
       continue;
     }
     si->childIdx = r.childIdx;
@@ -1979,17 +2391,20 @@ private:
 void PlanMemoryPass::runOnOperation() {
   ModuleOp moduleOp = getOperation();
   for (auto funcOp : moduleOp.getOps<func::FuncOp>()) {
-    ReserveBufferPlan reservePlan;
+    ReserveBufferPlans reservePlans;
     if (this->memMode == MemPlanMode::LOCAL_MEM_PLAN &&
-        failed(analyzeReserveBufferPlan(funcOp, reservePlan))) {
+        failed(analyzeReserveBufferPlans(funcOp, reservePlans))) {
       return signalPassFailure();
     }
-    if (this->memMode == MemPlanMode::LOCAL_MEM_PLAN &&
-        reservePlan.mode == ReserveBufferMode::Manual) {
-      reservePlan.reserveOp.emitOpError(
-          "pto.reserve_buffer with explicit 'base' (auto = false) is not "
-          "supported in PlanMemory; use --pto-level=level3 or set auto = true");
-      return signalPassFailure();
+    if (this->memMode == MemPlanMode::LOCAL_MEM_PLAN) {
+      for (ReserveBufferPlan &reservePlan : reservePlans) {
+        if (reservePlan.mode != ReserveBufferMode::Manual)
+          continue;
+        reservePlan.reserveOp.emitOpError(
+            "pto.reserve_buffer with explicit 'base' (auto = false) is not "
+            "supported in PlanMemory; use --pto-level=level3 or set auto = true");
+        return signalPassFailure();
+      }
     }
 
     MemLivenessAnalysis memLiveness(funcOp, this->memMode);
@@ -2008,6 +2423,8 @@ void PlanMemoryPass::runOnOperation() {
     memPlan.SetGenKillMap(memLiveness.genKillMap);
     memPlan.SetBuffer2MultiNum(memLiveness.buffer2MultiNum);
     memPlan.SetInplacePairList(memLiveness.inplacePairList);
+    memPlan.SetSemanticConflictPairs(memLiveness.semanticConflictPairs);
+    memPlan.SetStableValueOrder(std::move(memLiveness.stableValueOrder));
     if (failed(memPlan.plan())) {
       return signalPassFailure();
     }
@@ -2015,8 +2432,8 @@ void PlanMemoryPass::runOnOperation() {
     // normal local buffers are planned first, then reserve_buffer claims one
     // aligned hole in its target address space.
     if (this->memMode == MemPlanMode::LOCAL_MEM_PLAN &&
-        failed(assignAutoReserveBufferBase(reservePlan, memLiveness.bufferInfos,
-                                           memPlan.GetBuffer2Offsets()))) {
+        failed(assignAutoReserveBufferBases(reservePlans, memLiveness.bufferInfos,
+                                            memPlan.GetBuffer2Offsets()))) {
       return signalPassFailure();
     }
 
@@ -2026,9 +2443,6 @@ void PlanMemoryPass::runOnOperation() {
       return signalPassFailure();
     }
   }
-  llvm::errs() << "end PTO plan Mem!\n";
-  auto op = getOperation();
-  op->dump();
 }
 
 std::unique_ptr<Pass>

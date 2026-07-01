@@ -11,13 +11,20 @@
 // INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 // See LICENSE in the root of the software repository for the full text of the License.
 
+#include "PTO/IR/PTO.h"
 #include "PTO/Transforms/InsertSync/InsertSyncAnalysis.h"
+#include "PTO/IR/PTOTypeUtils.h"
 #include "PTO/Transforms/InsertSync/SyncCommon.h"
+#include "PTO/Transforms/SlotAffineAnalysis.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -29,11 +36,161 @@ using namespace mlir::pto;
 
 namespace mlir::pto {
 
+namespace {
+
+static constexpr uint64_t kVectorRegisterSizeInBytes = 256U;
+static constexpr unsigned kPipeVPruneMinRepeat = 16U;
+
+struct RepeatAccessShape {
+  SmallVector<int64_t, 2> fullShape;
+  SmallVector<int64_t, 2> validShape;
+  Type elementType;
+};
+
+static std::optional<RepeatAccessShape> getKnownRepeatAccessShapeFromType(Type ty) {
+  if (auto tileTy = dyn_cast<TileBufType>(ty)) {
+    ArrayRef<int64_t> fullShape = tileTy.getShape();
+    ArrayRef<int64_t> validShape = tileTy.getValidShape();
+    if (fullShape.size() != 2 || validShape.size() != 2) return std::nullopt;
+    if (fullShape[0] < 0 || fullShape[1] < 0 || validShape[0] < 0 ||
+        validShape[1] < 0)
+      return std::nullopt;
+    if (validShape[0] > fullShape[0] || validShape[1] > fullShape[1])
+      return std::nullopt;
+    return RepeatAccessShape{
+        SmallVector<int64_t, 2>{fullShape[0], fullShape[1]},
+        SmallVector<int64_t, 2>{validShape[0], validShape[1]},
+        tileTy.getElementType()};
+  }
+
+  if (auto memRefTy = dyn_cast<MemRefType>(ty)) {
+    if (!memRefTy.hasStaticShape() || memRefTy.getRank() != 2)
+      return std::nullopt;
+    auto shape = memRefTy.getShape();
+    return RepeatAccessShape{SmallVector<int64_t, 2>{shape[0], shape[1]},
+                             SmallVector<int64_t, 2>{shape[0], shape[1]},
+                             memRefTy.getElementType()};
+  }
+
+  return std::nullopt;
+}
+
+static std::optional<int64_t> getConstantIndex(Value value) {
+  if (!value) return std::nullopt;
+  APInt intValue;
+  if (!matchPattern(value, m_ConstantInt(&intValue))) return std::nullopt;
+  return intValue.getSExtValue();
+}
+
+static std::optional<RepeatAccessShape> getKnownRepeatAccessShape(Value access) {
+  if (!access) return std::nullopt;
+  auto shape = getKnownRepeatAccessShapeFromType(access.getType());
+  if (!shape) return std::nullopt;
+
+  if (auto bind = access.getDefiningOp<BindTileOp>()) {
+    auto row = getConstantIndex(bind.getValidRow());
+    auto col = getConstantIndex(bind.getValidCol());
+    if (row && col) {
+      if (*row < 0 || *col < 0 || *row > shape->fullShape[0] ||
+          *col > shape->fullShape[1])
+        return std::nullopt;
+      shape->validShape = SmallVector<int64_t, 2>{*row, *col};
+    } else if (bind.getValidRow() || bind.getValidCol()) {
+      return std::nullopt;
+    }
+  }
+
+  return shape;
+}
+
+static std::optional<BLayout> getKnownBLayout(Type ty) {
+  if (auto tileTy = dyn_cast<TileBufType>(ty)) {
+    int32_t layout = tileTy.getBLayoutValueI32();
+    if (layout == static_cast<int32_t>(BLayout::RowMajor))
+      return BLayout::RowMajor;
+    if (layout == static_cast<int32_t>(BLayout::ColMajor))
+      return BLayout::ColMajor;
+  }
+
+  if (auto memRefTy = dyn_cast<MemRefType>(ty)) {
+    SmallVector<int64_t> strides;
+    int64_t offset = 0;
+    if (failed(getStridesAndOffset(memRefTy, strides, offset)) ||
+        strides.size() != 2) {
+      return std::nullopt;
+    }
+    ArrayRef<int64_t> shape = memRefTy.getShape();
+    if (strides[1] == 1 && strides[0] == shape[1]) return BLayout::RowMajor;
+    if (strides[0] == 1 && strides[1] == shape[0]) return BLayout::ColMajor;
+  }
+
+  return std::nullopt;
+}
+
+static bool isProvenContiguousAccess(Value access,
+                                     const RepeatAccessShape &shape) {
+  auto layout = getKnownBLayout(access.getType());
+  if (!layout) return false;
+
+  int64_t fullRow = shape.fullShape[0];
+  int64_t fullCol = shape.fullShape[1];
+  int64_t validRow = shape.validShape[0];
+  int64_t validCol = shape.validShape[1];
+
+  if (*layout == BLayout::RowMajor)
+    return validCol == fullCol || validRow == 1;
+  if (*layout == BLayout::ColMajor)
+    return validRow == fullRow || validCol == 1;
+  return false;
+}
+
+static std::optional<unsigned> getRepeatCountForAccess(Value access) {
+  if (!access) return std::nullopt;
+  auto shape = getKnownRepeatAccessShape(access);
+  if (!shape || !isProvenContiguousAccess(access, *shape)) return std::nullopt;
+
+  unsigned elemBytes = pto::getPTOStorageElemByteSize(shape->elementType);
+  if (elemBytes == 0) return std::nullopt;
+
+  uint64_t validElems = static_cast<uint64_t>(shape->validShape[0]) *
+                        static_cast<uint64_t>(shape->validShape[1]);
+  uint64_t elemsPerRepeat = kVectorRegisterSizeInBytes / elemBytes;
+  if (elemsPerRepeat == 0) return std::nullopt;
+
+  uint64_t repeat = (validElems + elemsPerRepeat - 1U) / elemsPerRepeat;
+  if (repeat > std::numeric_limits<unsigned>::max()) return std::nullopt;
+  return static_cast<unsigned>(repeat);
+}
+
+static bool isSameExactAccess(const BaseMemInfo *lhs, const BaseMemInfo *rhs) {
+  return lhs && rhs && *lhs == *rhs;
+}
+
+static bool containsExactAccess(const SmallVector<const BaseMemInfo *> &infos,
+                                const BaseMemInfo *access) {
+  return llvm::any_of(infos, [&](const BaseMemInfo *info) {
+    return isSameExactAccess(info, access);
+  });
+}
+
+} // namespace
+
 static constexpr unsigned kPipeStateSize =
     static_cast<unsigned>(PipelineType::PIPE_LAST) + 1U;
 
 static bool isValidPipeIndex(PipelineType pipe) {
   return static_cast<unsigned>(pipe) < kPipeStateSize;
+}
+
+static bool isTLoadCompound(const CompoundInstanceElement *compound) {
+  return compound && compound->elementOp && isa<pto::TLoadOp>(compound->elementOp);
+}
+
+static bool isTLoadToTLoadWAWExempt(const CompoundInstanceElement *nowCompound,
+                                    const CompoundInstanceElement *frontCompound) {
+  return isTLoadCompound(nowCompound) && isTLoadCompound(frontCompound) &&
+         nowCompound->kPipeValue == PipelineType::PIPE_MTE2 &&
+         frontCompound->kPipeValue == PipelineType::PIPE_MTE2;
 }
 
 // ==============================================================================
@@ -203,8 +360,13 @@ unsigned InsertSyncAnalysis::InsertLoopSync(
     unsigned newEnd = index;
     InsertSeqSync(nowCompound, syncElement, static_cast<int>(newBegin),
                   static_cast<int>(newEnd), syncRecordForList, forEndIndex);
-    // Conservatively assume loop bodies are executed and keep the updated state.
-    syncRecordList = std::move(syncRecordForList);
+    // A loop may execute zero iterations at runtime. Keep correctness for both
+    // paths by not promoting alreadySync from the loop-body traversal into the
+    // outer state. We only carry syncFinder updates, matching no-else branch
+    // behavior in InsertBranchSync.
+    for (size_t bufferIdx = 0; bufferIdx < syncRecordList.size(); bufferIdx++)
+      syncRecordList[bufferIdx].syncFinder =
+          syncRecordForList[bufferIdx].syncFinder;
     return (loopElement->endId - loopElement->beginId);
   }
   return 0;
@@ -276,6 +438,29 @@ void InsertSyncAnalysis::InsertSync(
   MemAnalyze(nowCompound, frontCompound, syncRecordList, forEndIndex);
 }
 
+// Returns true if a *same-iter* multi-buffer dep pair can be dropped
+// because the producer's and consumer's slot SSA expressions are provably
+// disjoint modulo N. Only applied to forward (non-back-edge) deps -- the
+// back-edge path still needs to sync per-slot via dyn event id (the
+// prefetch idiom). When the analysis is inconclusive (kUnknown / kEqual)
+// the dep is kept and the existing conservative path runs.
+static bool isForwardDepDroppableBySlotAffine(const BaseMemInfo *a,
+                                              const BaseMemInfo *b) {
+  if (!a || !b)
+    return false;
+  size_t aN = a->baseAddresses.size();
+  size_t bN = b->baseAddresses.size();
+  size_t n = std::max(aN, bN);
+  if (n < 2)
+    return false;
+  Value slotA = findSlotMarkerExpr(a->baseBuffer);
+  Value slotB = findSlotMarkerExpr(b->baseBuffer);
+  if (!slotA || !slotB)
+    return false;
+  return compareSlotSSA(slotA, slotB, static_cast<uint32_t>(n)) ==
+         SlotRelation::kDisjoint;
+}
+
 void InsertSyncAnalysis::MemAnalyze(
     CompoundInstanceElement *nowCompound, CompoundInstanceElement *frontCompound,
     SyncRecordList &syncRecordList,
@@ -286,6 +471,25 @@ void InsertSyncAnalysis::MemAnalyze(
 
   DepBaseMemInfoPairVec depVec;
   if (!IsMemInfoHasDependency(nowCompound, frontCompound, depVec)) {
+    return;
+  }
+
+  // Same-iter (forward) deps: drop pairs that the affine analysis proves
+  // touch disjoint slots in every iteration of the multi-buffer loop.
+  // Back-edge deps stay untouched -- they still need per-slot syncing
+  // through the dyn-event-id pipeline.
+  if (!forEndIndex.has_value()) {
+    auto isDroppable = [](const std::pair<const BaseMemInfo *,
+                                          const BaseMemInfo *> &pair) {
+      return isForwardDepDroppableBySlotAffine(pair.first, pair.second);
+    };
+    depVec.erase(std::remove_if(depVec.begin(), depVec.end(), isDroppable),
+                 depVec.end());
+    if (depVec.empty())
+      return;
+  }
+
+  if (CanPrunePipeVBarrier(nowCompound, frontCompound, depVec, forEndIndex)) {
     return;
   }
 
@@ -312,8 +516,10 @@ bool InsertSyncAnalysis::IsMemInfoHasDependency(
                                           depBaseMemInfosVec);
   hasDependency |= memAnalyzer_.DepBetween(nowCompound->defVec, frontCompound->useVec,
                                           depBaseMemInfosVec);
-  hasDependency |= memAnalyzer_.DepBetween(nowCompound->defVec, frontCompound->defVec,
-                                          depBaseMemInfosVec);
+  if (!isTLoadToTLoadWAWExempt(nowCompound, frontCompound)) {
+    hasDependency |= memAnalyzer_.DepBetween(nowCompound->defVec, frontCompound->defVec,
+                                            depBaseMemInfosVec);
+  }
 
   // Special hazard: ACC (L0C) read/read cross-pipe ordering.
   //
@@ -333,6 +539,48 @@ bool InsertSyncAnalysis::IsMemInfoHasDependency(
   }
 
   return hasDependency;
+}
+
+bool InsertSyncAnalysis::CanPrunePipeVBarrier(
+    const CompoundInstanceElement *nowCompound,
+    const CompoundInstanceElement *frontCompound,
+    const DepBaseMemInfoPairVec &depBaseMemInfosVec,
+    const std::optional<unsigned> &forEndIndex) const {
+  if (forEndIndex.has_value()) return false;
+  if (!nowCompound || !frontCompound) return false;
+  if (nowCompound->kPipeValue != PipelineType::PIPE_V ||
+      frontCompound->kPipeValue != PipelineType::PIPE_V) {
+    return false;
+  }
+
+  // PIPE_V has a hardware-safe same-access chain case: exact same-access
+  // dependencies from the producer result to the consumer source do not require
+  // a vector-pipe barrier once the producer repeat is large enough. Keep the
+  // check conservative: all dependency pairs for this candidate must describe
+  // the exact same access.
+  SmallVector<const BaseMemInfo *, 2> producerAccesses;
+  for (const auto &pair : depBaseMemInfosVec) {
+    if (!isSameExactAccess(pair.first, pair.second)) return false;
+
+    if (containsExactAccess(nowCompound->useVec, pair.first) &&
+        containsExactAccess(frontCompound->defVec, pair.second)) {
+      if (!llvm::is_contained(producerAccesses, pair.second))
+        producerAccesses.push_back(pair.second);
+    } else {
+      return false;
+    }
+  }
+  if (producerAccesses.empty()) return false;
+
+  // The caller is analyzing this specific front->now dependency. Do not look
+  // for a later text-order writer here; it may belong to a different branch
+  // path or a zero-trip loop body.
+  for (const BaseMemInfo *producerAccess : producerAccesses) {
+    auto repeat = getRepeatCountForAccess(producerAccess->baseBuffer);
+    if (!repeat || *repeat < kPipeVPruneMinRepeat) return false;
+  }
+
+  return true;
 }
 
 void InsertSyncAnalysis::InsertSyncOperation(
@@ -367,9 +615,38 @@ void InsertSyncAnalysis::InsertSyncOperation(
     setOp->SetDepSyncIRIndex(frontCompound->GetIndex());
     waitOp->SetDepSyncIRIndex(frontCompound->GetIndex());
 
-    // Back-edge dependencies may require multi-buffer event IDs.
+    // Back-edge dependencies may require multi-buffer event IDs. When N
+    // dyn event IDs are warranted, also plumb the per-side slot SSA so
+    // codegen can lower into `pto.set_flag_dyn` / `pto.wait_flag_dyn`.
     if (forEndIndex.has_value()) {
       int eventIdNum = GetEventIdNum(depBaseMemInfosVec);
+      if (eventIdNum > 1) {
+        // Each dep pair has (now=consumer, front=producer). The producer's
+        // slot SSA gates the `set_flag_dyn`; the consumer's gates the
+        // `wait_flag_dyn`. Walk the first viable dep pair to extract them.
+        Value producerSlot;
+        Value consumerSlot;
+        for (auto &pair : depBaseMemInfosVec) {
+          if (pair.second && pair.second->baseBuffer)
+            producerSlot = findSlotMarkerExpr(pair.second->baseBuffer);
+          if (pair.first && pair.first->baseBuffer)
+            consumerSlot = findSlotMarkerExpr(pair.first->baseBuffer);
+          if (producerSlot && consumerSlot)
+            break;
+        }
+        if (!producerSlot || !consumerSlot) {
+          // No slot SSA threaded through -- fall back to single event id.
+          // This keeps non-multi-buffer codepaths untouched even if their
+          // baseAddresses happen to have multiple entries for some other
+          // reason (e.g. memref subview).
+          eventIdNum = 1;
+        } else {
+          setOp->slotSSAExpr = producerSlot;
+          setOp->slotCount = static_cast<uint32_t>(eventIdNum);
+          waitOp->slotSSAExpr = consumerSlot;
+          waitOp->slotCount = static_cast<uint32_t>(eventIdNum);
+        }
+      }
       setOp->eventIdNum = eventIdNum;
       waitOp->eventIdNum = eventIdNum;
     }
@@ -491,6 +768,7 @@ void InsertSyncAnalysis::InsertLastPipeAll() {
     auto barrierOp = std::make_unique<SyncOperation>(
         SyncOperation::TYPE::PIPE_BARRIER, PipelineType::PIPE_ALL,
         PipelineType::PIPE_ALL, syncIndex_, element->GetIndex(), std::nullopt);
+    barrierOp->MarkAutoSyncTailBarrier();
 
     SyncOperation *barrierRawPtr = barrierOp.get();
     SmallVector<std::unique_ptr<SyncOperation>> syncGroup;
@@ -531,6 +809,16 @@ SmallVector<Value> InsertSyncAnalysis::GetMemInfoBuffers(
 
 int InsertSyncAnalysis::GetEventIdNum(
     const DepBaseMemInfoPairVec &depBaseMemInfosVec) {
+  // A back-edge dependency benefits from N dynamic event IDs whenever at
+  // least one side is a multi-buffer access. We detect that from the
+  // BaseMemInfo's `baseAddresses` size, which `UpdateSlotMarkerAliasBufferInfo`
+  // populated:
+  //   - kSingle / const-slot              : size == 1
+  //   - dyn-slot (PTOIRTranslator default) : size == N (all slots, conservative)
+  // For the alias to even reach this point both sides share a root, so the
+  // slot count derived from either side's full address set should be the
+  // same N. We pick the max to be robust against accidental narrowing.
+  int eventIdNum = 1;
   for (const auto &pair : depBaseMemInfosVec) {
     bool isLocalA =
         pair.first && (pair.first->scope == pto::AddressSpace::MAT ||
@@ -538,9 +826,23 @@ int InsertSyncAnalysis::GetEventIdNum(
     bool isLocalB =
         pair.second && (pair.second->scope == pto::AddressSpace::MAT ||
                         pair.second->scope == pto::AddressSpace::VEC);
-    if (isLocalA || isLocalB) return 2;
+    if (!isLocalA && !isLocalB)
+      continue;
+    size_t aN = pair.first ? pair.first->baseAddresses.size() : 1;
+    size_t bN = pair.second ? pair.second->baseAddresses.size() : 1;
+    int pairN = static_cast<int>(std::max(aN, bN));
+    if (pairN <= 1)
+      continue;
+    if (eventIdNum == 1) {
+      eventIdNum = pairN;
+    } else if (eventIdNum != pairN) {
+      // Multiple dep pairs disagreeing on N: fall back to single event id
+      // for safety. With more work this could be relaxed by per-pair
+      // multi-buffer reasoning.
+      return 1;
+    }
   }
-  return 1;
+  return eventIdNum;
 }
 
 bool InsertSyncAnalysis::IsGMHazard(

@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-from mlir.ir import Context, Location, Module, InsertionPoint
+from mlir.ir import Context, Location, Module, InsertionPoint, UnitAttr
 from mlir.dialects import func, arith, pto
 from mlir.ir import F32Type, IndexType
 
@@ -34,6 +34,7 @@ def build():
             fn_ty = func.FunctionType.get([ptr_f32, ptr_f32], [])
             with InsertionPoint(m.body):
                 fn = func.FuncOp("abs_kernel_2d", fn_ty)
+                fn.operation.attributes["pto.entry"] = UnitAttr.get(ctx)
                 entry = fn.add_entry_block()
 
             with InsertionPoint(entry):
@@ -46,10 +47,7 @@ def build():
                 tv0 = pto.MakeTensorViewOp(tv2_f32, arg0, [c32, c32], [c32, c1]).result
                 tv1 = pto.MakeTensorViewOp(tv2_f32, arg1, [c32, c32], [c32, c1]).result
 
-                # Test pto.get_tensor_view_dim: get dim sizes from tensor_view and use as partition sizes
-                dim0 = pto.GetTensorViewDimOp(tv0, c0).result
-                dim1 = pto.GetTensorViewDimOp(tv0, c1).result
-                sv0 = pto.PartitionViewOp(tile_view_32, tv0, offsets=[c0, c0], sizes=[dim0, dim1]).result
+                sv0 = pto.PartitionViewOp(tile_view_32, tv0, offsets=[c0, c0], sizes=[c32, c32]).result
 
                 tb0 = pto.AllocTileOp(tile_buf_32).result
                 tb1 = pto.AllocTileOp(tile_buf_32).result

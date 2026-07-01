@@ -39,6 +39,7 @@ target_link_libraries(_pto PRIVATE
   MLIRSupport
   MLIRArithDialect
   MLIRMemRefDialect
+  MLIRSCFDialect
   MLIRDestinationStyleOpInterface
   MLIRInferTypeOpInterface
   MLIRSideEffectInterfaces
@@ -47,6 +48,7 @@ target_link_libraries(_pto PRIVATE
   MLIRLoopLikeInterface
   MLIRViewLikeInterface
   MLIRFunctionInterfaces
+  MLIRLLVMDialect
 )
 
 # 关键：放到 mlir/_mlir_libs 下（匹配 MLIR dialect python 的 import 习惯）
@@ -60,8 +62,12 @@ if(APPLE)
   target_link_options(_pto PRIVATE "LINKER:-undefined,dynamic_lookup")
 endif()
 
+if(NOT MLIR_PYTHON_PACKAGE_DIR)
+  message(FATAL_ERROR "MLIR_PYTHON_PACKAGE_DIR must be set when PTO_ENABLE_PYTHON_BINDING=ON")
+endif()
+
 install(TARGETS _pto
-  LIBRARY DESTINATION "${MLIR_PYTHON_PACKAGE_DIR}/mlir/_mlir_libs"
+  LIBRARY DESTINATION "mlir/_mlir_libs"
 )
 
 # ---- 2) Generate ODS Python op bindings: _pto_ops_gen.py ----
@@ -96,9 +102,34 @@ install(FILES
   DESTINATION mlir/dialects
 )
 
+# Keep the MLIR build-tree Python package self-consistent as well. When users
+# import `mlir.dialects.pto` directly from MLIR_PYTHON_PACKAGE_DIR, the wrapper
+# modules must be updated alongside the native `_pto` extension during normal
+# builds, not just during `cmake --install`.
 add_custom_command(TARGET _pto POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory
-          "${CMAKE_BINARY_DIR}/python/mlir/_mlir_libs"
+          "${MLIR_PYTHON_PACKAGE_DIR}/mlir/dialects"
+  COMMAND ${CMAKE_COMMAND} -E make_directory
+          "${MLIR_PYTHON_PACKAGE_DIR}/mlir/_mlir_libs"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${PTO_PY_SRC}"
+          "${MLIR_PYTHON_PACKAGE_DIR}/mlir/dialects/pto.py"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${CMAKE_CURRENT_BINARY_DIR}/_pto_ops_gen.py"
+          "${MLIR_PYTHON_PACKAGE_DIR}/mlir/dialects/_pto_ops_gen.py"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "$<TARGET_FILE:_pto>"
+          "${MLIR_PYTHON_PACKAGE_DIR}/mlir/_mlir_libs/$<TARGET_FILE_NAME:_pto>"
   VERBATIM
 )
 
+add_custom_command(TARGET _pto POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory
+          "${CMAKE_BINARY_DIR}/python/mlir/_mlir_libs"
+  COMMAND ${CMAKE_COMMAND} -E make_directory
+          "${MLIR_PYTHON_PACKAGE_DIR}/mlir/_mlir_libs"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "$<TARGET_FILE:_pto>"
+          "${MLIR_PYTHON_PACKAGE_DIR}/mlir/_mlir_libs/$<TARGET_FILE_NAME:_pto>"
+  VERBATIM
+)

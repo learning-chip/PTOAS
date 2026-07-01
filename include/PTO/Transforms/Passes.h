@@ -9,7 +9,7 @@
 //===- Passes.h - Pass Entrypoints ------------------------------*- C++ -*-===//
 //===----------------------------------------------------------------------===//
 //
-// TODO.
+// Pass factory declarations for PTO transform pipelines.
 //
 //===----------------------------------------------------------------------===//
 
@@ -34,13 +34,26 @@ namespace pto {
 #include "PTO/Transforms/Passes.h.inc"
 
 std::unique_ptr<Pass> createLoweringSyncToPipePass();
+std::unique_ptr<Pass> createPTOAssignDefaultFrontendPipeIdPass();
 std::unique_ptr<Pass> createPTOLowerFrontendPipeOpsPass();
+std::unique_ptr<Pass> createPTOInferValidatePipeInitPass();
 std::unique_ptr<Pass> createPTOResolveReservedBuffersPass();
 std::unique_ptr<Pass> createPTOWrapFunctionsInSectionsPass();
+std::unique_ptr<Pass> createPTONormalizeUncoveredTileSectionsPass();
+std::unique_ptr<Pass> createVPTOSplitCVModulePass();
+std::unique_ptr<Pass> createVPTONormalizeContainerPass();
 std::unique_ptr<Pass> createPTOVerifyTFreePass();
+std::unique_ptr<Pass> createPTOVerifySubkernelPipeContractPass();
 
 // Creates a pass for ...
 std::unique_ptr<Pass> createPTOInsertSyncPass();
+std::unique_ptr<Pass> createPTOInjectBarrierAllSyncPass();
+std::unique_ptr<Pass>
+createPTOBufidSyncPass(const PTOBufidSyncOptions &options = {});
+
+// Graph-based intra-core sync solver (coexists with PTOInsertSync).
+std::unique_ptr<Pass>
+createPTOGraphSyncSolverPass(const PTOGraphSyncSolverOptions &options = {});
 // Default arch is A3 unless overridden by callers.
 std::unique_ptr<Pass> createEmitPTOManualPass();
 // Explicitly select target arch for codegen.
@@ -60,12 +73,50 @@ createPlanMemoryPass(const PlanMemoryOptions &planMemoryOption = {});
 
 std::unique_ptr<Pass> createPTORemoveRedundantBarrierPass();
 std::unique_ptr<Pass> createPTOViewToMemrefPass();
+std::unique_ptr<Pass> createPTOValidateIntToPtrUsesPass();
+std::unique_ptr<Pass> createPTOMaterializeTileHandlesPass();
+std::unique_ptr<Pass> createPTOResolveBufferSelectPass();
 std::unique_ptr<Pass> createInferPTOLayoutPass();
-// Declare register function
-void registerPTOPasses();
+std::unique_ptr<Pass> createPTOA5NormalizeTMovPass();
+std::unique_ptr<Pass> createPTORemoveIdentityTMovPass();
+std::unique_ptr<Pass> createPreFusionAnalysisPass();
+std::unique_ptr<Pass> createPrintPreFusionAnalysisPass();
+std::unique_ptr<Pass> createFusionPlanPass();
+std::unique_ptr<Pass>
+createFusionPlanPass(const FusionPlanOptions &options);
+std::unique_ptr<Pass> createOpSchedulingPass();
+std::unique_ptr<Pass> createPTOMarkLastUsePass();
+std::unique_ptr<Pass> createPTOFusionRegionGenPass();
 
-} // namespace pto
-} // namespace mlir
+LogicalResult validateIntToPtrUses(func::FuncOp func);
+
+std::unique_ptr<Pass> createPTOUnrollSIMTForPass();
+std::unique_ptr<Pass> createPTOInferVPTOVecScopePass();
+std::unique_ptr<Pass> createVPTOExpandWrapperOpsPass();
+std::unique_ptr<Pass> createPTOVPTOPtrBoundaryPass();
+std::unique_ptr<Pass>
+createPTOLowLevelLoopFusionPass(const PTOLowLevelLoopFusionOptions &options = {});
+std::unique_ptr<Pass> createPTOFusionPredicateElisionPass();
+std::unique_ptr<Pass> createPTOFusionLoadStoreElisionPass();
+std::unique_ptr<Pass> createPTOFlattenFusionRegionPass();
+std::unique_ptr<Pass> createVPTOPtrNormalizePass();
+std::unique_ptr<Pass> createVPTOPtrCastCleanupPass();
+LogicalResult validateVPTOAuthoringIR(ModuleOp module,
+                                      llvm::raw_ostream *diagOS = nullptr);
+LogicalResult validateVPTOEmissionIR(ModuleOp module,
+                                     llvm::raw_ostream *diagOS = nullptr);
+std::unique_ptr<Pass> createPTOValidateVPTOIRPass();
+std::unique_ptr<Pass> createPTOValidateVPTOEmissionIRPass();
+std::unique_ptr<Pass> createExpandTileOpPass();
+std::unique_ptr<Pass> createExpandTileOpPass(const ExpandTileOpOptions &options);
+std::unique_ptr<Pass> createFoldTileBufIntrinsicsPass();
+std::unique_ptr<Pass> createFoldTileBufIntrinsicsPass(llvm::StringRef foldMode);
+std::unique_ptr<Pass> createPTOCanonicalizeIRPass();
+std::unique_ptr<Pass>
+createPTOInlineLibCallPass(const PTOInlineLibCallOptions &options = {});
+std::unique_ptr<Pass> createPTOInlineBackendHelpersPass(
+    const PTOInlineBackendHelpersOptions &options = {});
+void registerPTOViewToMemrefPass();
 
 //===----------------------------------------------------------------------===//
 // Registration
@@ -74,5 +125,9 @@ void registerPTOPasses();
 #undef GEN_PASS_DECL
 #define GEN_PASS_REGISTRATION
 #include "PTO/Transforms/Passes.h.inc"
+
+} // namespace pto
+} // namespace mlir
+
 
 #endif // MLIR_DIALECT_PTO_TRANSFORMS_PASSES_H

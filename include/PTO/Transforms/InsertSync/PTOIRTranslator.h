@@ -37,7 +37,10 @@ public:
       syncIR_(syncIR), 
       buffer2MemInfoMap_(buffer2MemInfoMap),
       memAnalyzer_(memDepAnalyzer),
-      mode_(syncAnalysisMode) { };
+      mode_(syncAnalysisMode) {
+    (void)memAnalyzer_;
+    (void)mode_;
+  };
  
   // 核心入口：执行 IR 分析和转换
   void Build();
@@ -67,12 +70,17 @@ private:
   // --- 内存/Alias 分析 ---
   void UpdateKernelArgMemInfo();
   LogicalResult UpdateAllocTileOpMemInfo(pto::AllocTileOp op);
+  LogicalResult UpdateDeclareGlobalOpMemInfo(pto::DeclareGlobalOp op);
   LogicalResult UpdateDeclareTileMemRefOpMemInfo(pto::DeclareTileMemRefOp op);
   LogicalResult UpdatePointerCastOpMemInfo(pto::PointerCastOp op);
   LogicalResult UpdateMemrefAllocOpMemInfo(memref::AllocOp op);
   
   // 处理 View/Alias (MakeTensorView, Subview, Mov)
   void UpdateAliasBufferInfo(Value result, Value source);
+  void UpdateConservativeAliasBufferInfo(Value result, Value source);
+  void UpdateMemrefSubViewAliasBufferInfo(memref::SubViewOp op);
+  void UpdateTileSubViewAliasBufferInfo(pto::SubViewOp op);
+  void UpdateSlotMarkerAliasBufferInfo(pto::SlotMarkerOp op);
  
   // --- 控制流处理 (SCF) ---
   void UpdateForOpInfo(scf::ForOp forOp);
@@ -82,6 +90,10 @@ private:
  
   // --- 核心：处理计算/搬运指令 (生成 Compound 节点) ---
   void UpdatePTOOpInfo(Operation *op);
+  void UpdateMacroOpInfo(Operation *op);
+  void MakeMacroCompound(Operation *op, PipelineType pipe, ValueRange defValues,
+                         ValueRange useValues, int macroPhaseId);
+  void UpdatePTODSLSubkernelCallInfo(func::CallOp callOp);
  
   // --- 辅助函数 ---
   

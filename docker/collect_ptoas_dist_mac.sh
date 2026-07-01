@@ -13,6 +13,7 @@
 #
 # Required environment variables:
 #   LLVM_BUILD_DIR  - Path to LLVM build directory
+#   PTO_BUILD_DIR   - Path to PTO build directory (optional, defaults to PTO_SOURCE_DIR/build)
 #   PTO_INSTALL_DIR - Path to PTO install directory
 #   PTO_SOURCE_DIR  - Path to PTO source directory
 #
@@ -21,6 +22,8 @@
 #     ptoas           - Wrapper script that sets up DYLD_LIBRARY_PATH
 #     bin/ptoas       - The actual ptoas binary
 #     lib/*.dylib     - Required shared library dependencies
+#     share/ptoas/TileOps - TileLang template library
+#     tilelang_dsl/   - TileLang DSL Python package
 
 set -euo pipefail
 
@@ -39,8 +42,13 @@ for var in LLVM_BUILD_DIR PTO_INSTALL_DIR PTO_SOURCE_DIR; do
   fi
 done
 
-PTOAS_BIN="${PTO_SOURCE_DIR}/build/tools/ptoas/ptoas"
+PTO_BUILD_DIR="${PTO_BUILD_DIR:-${PTO_SOURCE_DIR}/build}"
+PTOAS_BIN="${PTO_BUILD_DIR}/tools/ptoas/ptoas"
 PTOAS_DEPS_DIR="${PTOAS_DIST_DIR}/lib"
+PTOAS_TILEOPS_SRC_DIR="${PTO_INSTALL_DIR}/share/ptoas/TileOps"
+PTOAS_TILEOPS_DIST_DIR="${PTOAS_DIST_DIR}/share/ptoas/TileOps"
+PTOAS_TILELANG_DSL_SRC_DIR="${PTO_INSTALL_DIR}/tilelang_dsl"
+PTOAS_TILELANG_DSL_DIST_DIR="${PTOAS_DIST_DIR}/tilelang_dsl"
 UNRESOLVED_NON_SYSTEM_COUNT=0
 
 if [ ! -f "$PTOAS_BIN" ]; then
@@ -48,7 +56,10 @@ if [ ! -f "$PTOAS_BIN" ]; then
   exit 1
 fi
 
-mkdir -p "${PTOAS_DIST_DIR}/bin" "${PTOAS_DEPS_DIR}"
+mkdir -p \
+  "${PTOAS_DIST_DIR}/bin" \
+  "${PTOAS_DEPS_DIR}" \
+  "$(dirname "${PTOAS_TILEOPS_DIST_DIR}")"
 cp -fL "$PTOAS_BIN" "${PTOAS_DIST_DIR}/bin/"
 chmod +x "${PTOAS_DIST_DIR}/bin/ptoas"
 
@@ -236,6 +247,19 @@ PY
 echo "Collecting dylib dependencies..."
 collect_dylibs "${PTOAS_DIST_DIR}/bin/ptoas"
 
+echo "Copying TileLang runtime resources..."
+if [[ ! -d "${PTOAS_TILEOPS_SRC_DIR}" ]]; then
+  echo "Error: TileOps resource directory not found at ${PTOAS_TILEOPS_SRC_DIR}" >&2
+  exit 1
+fi
+if [[ ! -d "${PTOAS_TILELANG_DSL_SRC_DIR}" ]]; then
+  echo "Error: tilelang_dsl package directory not found at ${PTOAS_TILELANG_DSL_SRC_DIR}" >&2
+  exit 1
+fi
+rm -rf "${PTOAS_TILEOPS_DIST_DIR}" "${PTOAS_TILELANG_DSL_DIST_DIR}"
+cp -R "${PTOAS_TILEOPS_SRC_DIR}" "${PTOAS_TILEOPS_DIST_DIR}"
+cp -R "${PTOAS_TILELANG_DSL_SRC_DIR}" "${PTOAS_TILELANG_DSL_DIST_DIR}"
+
 echo "Rewriting packaged install names..."
 rewrite_packaged_install_names
 
@@ -328,15 +352,19 @@ if [ -n "${PTOAS_VERSION:-}" ]; then
 else
   echo "$VERSION_OUTPUT" | grep -Eq '^ptoas [0-9]+\.[0-9]+$'
 fi
+test -d "${PTOAS_TILEOPS_DIST_DIR}"
+test -f "${PTOAS_TILELANG_DSL_DIST_DIR}/__init__.py"
 env -u DYLD_LIBRARY_PATH -u LD_LIBRARY_PATH \
   "${PTOAS_DIST_DIR}/ptoas" \
-  "${PTO_SOURCE_DIR}/test/basic/kernel_kind_vector_scf_while_emitc.pto" \
+  "${PTO_SOURCE_DIR}/test/lit/pto/kernel_kind_vector_scf_while_emitc.pto" \
   >/dev/null
 
 echo ""
 echo "=== ptoas distribution contents ==="
 ls -la "${PTOAS_DIST_DIR}/"
 ls -la "${PTOAS_DIST_DIR}/bin/"
+ls -la "${PTOAS_DIST_DIR}/share/ptoas/"
+ls -la "${PTOAS_TILELANG_DSL_DIST_DIR}"
 DYLIB_COUNT=$(find "${PTOAS_DEPS_DIR}" -name "*.dylib" 2>/dev/null | wc -l)
 echo "=== Collected .dylib dependencies (${DYLIB_COUNT} files) ==="
 du -sh "${PTOAS_DEPS_DIR}/"

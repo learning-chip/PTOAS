@@ -19,9 +19,6 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "llvm/ADT/SmallSet.h"
-
-
-
 #include <list>
 
 namespace mlir {
@@ -37,6 +34,8 @@ struct ValueComparator {
     return isLessValue(a, b);
   }
 };
+
+using StableValueOrderMap = DenseMap<Value, uint32_t>;
 
 /// Various states when collecting gen-kill.
 enum BufferStatus { UNDEFFINED = 0, DEFFINED, GENED, KILLED };
@@ -87,7 +86,7 @@ struct BufferInfo {
   /// memory. Because here do not union the lifetime of A and C, just set the
   /// ignoreInplace of A and C to be true so that A will not be inplaced with
   /// other buffer due to wrong lifetime.
-  /// TODO: Modify the lifetime of A and C and allow them to be inplaced further
+  /// Extending the lifetime union of A and C would allow further inplace reuse.
   bool ignoreInplace{false};
 };
 
@@ -148,7 +147,21 @@ struct StorageEntry {
   SmallVector<Value> inplaceBuffers;
 
   /// multiBuffer relation StorageEntry.
+  /// For N >= 2 this aliases `relationOtherBuffers.front()` -- kept around so
+  /// existing N == 2 code paths can keep using the single-sibling field.
   StorageEntry *relationPongEntry{nullptr};
+
+  /// Sibling slot entries for multi-buffer (N - 1 entries for slot 1..N-1).
+  /// The primary entry occupies slot 0; siblings own slot 1..N-1. Sibling
+  /// entries have `isMultiBufferSlot == true` and live in `StorageEntryVec`
+  /// independently of their primary -- the planner assigns each one its own
+  /// `bitsOffset` via the same Stage0/Stage2 logic used for normal allocs.
+  SmallVector<StorageEntry *> relationOtherBuffers;
+
+  /// True if this entry is a multi-buffer sibling (slot >= 1) that should
+  /// NOT independently write into `buffer2Offsets` -- the primary entry is
+  /// responsible for emitting all slot offsets in slot order.
+  bool isMultiBufferSlot{false};
 
   /// The number of multibuffer optimization.
   /// note: default 1 which means single buffer and does not do multibuffer
@@ -268,6 +281,9 @@ public:
   /// map from buffer value to its buffer information.
   std::map<Value, BufferInfo, ValueComparator> bufferInfos;
 
+  /// stable IR order for Values used to keep memory planning deterministic.
+  StableValueOrderMap stableValueOrder;
+
   /// map from buffer to its lifetime.
   DenseMap<Value, std::shared_ptr<BufferLife>> buffer2Life;
 
@@ -282,6 +298,9 @@ public:
 
   /// record inplace pair list.
   SmallVector<ValuePair> inplacePairList;
+
+  /// record semantic conflict pair list.
+  SmallVector<ValuePair> semanticConflictPairs;
 
   /// now plan mode is LOCAL_MEM_PLAN.
   bool isLocalMemPlan() const;
@@ -312,6 +331,13 @@ private:
 
   /// Update buffer alias information for ifop.
   void UpdateIfOpBufferAlias(scf::IfOp ifOp, scf::YieldOp yieldOp);
+
+  /// Recursive operation for pto.fusion_region.
+  void RecursiveFusionRegionOp(pto::FusionRegionOp fusionRegion, Liveness live);
+
+  /// Update buffer alias information for pto.fusion_region results.
+  void UpdateFusionRegionBufferAlias(pto::FusionRegionOp fusionRegion,
+                                     pto::YieldOp yieldOp);
 
   /// Update and obtain op info information.
   OpInfo *UpdateLinearOperation(Operation *op);
@@ -379,6 +405,10 @@ private:
   /// e.g. for iter arg and for yield.
   void InitializeInplacePairList();
 
+  /// Record semantic non-reuse pairs for buffers that may be used
+  /// simultaneously inside one instruction, such as scratch and dst.
+  void RecordSemanticConflict(Value lhs, Value rhs);
+
   func::FuncOp func_;
 
   /// different mode for mem plan.
@@ -438,6 +468,14 @@ public:
     inplacePairList = inplaceList;
   }
 
+  inline void SetSemanticConflictPairs(SmallVector<ValuePair> conflictPairs) {
+    semanticConflictPairs = std::move(conflictPairs);
+  }
+
+  inline void SetStableValueOrder(StableValueOrderMap valueOrder) {
+    stableValueOrder = std::move(valueOrder);
+  }
+
   /// Setup the device's storage specs
   LogicalResult InitMemSpecsFromModule(func::FuncOp funcOp);
 
@@ -494,6 +532,14 @@ private:
 
   /// Start plan.
   PlanStatus PlanMemAddressOfWholeLocalBuffer();
+
+  /// Plan a single local buffer without reuse.
+  PlanStatus PlanSingleLocalBuffer(StorageEntry *rootStorageEntry, size_t align,
+                                   size_t maxBits);
+
+  /// Plan a reusable local buffer scope.
+  PlanStatus PlanReusableLocalBuffer(StorageEntry *rootStorageEntry,
+                                     size_t align, size_t maxBits);
 
   /// Plan memory only by level0 to report failure info.
   void PlanMemAddressForLevel0(StorageEntry *rootStorageEntry);
@@ -607,6 +653,9 @@ private:
   DenseMap<ValuePair, BufferLife>
   GetOverlapBufferLife(const BufferLifeVec &b1, const BufferLifeVec &b2) const;
 
+  bool HasSemanticConflict(const StorageEntry *entry,
+                           const BufferLifeVec &bufferLives) const;
+
   /// Reorder and make the storage entries of ping and pong continuous.
   void
   ReorderContinuousPingPongEntry(SmallVector<StorageEntry *> &storageEntryVec);
@@ -687,6 +736,9 @@ private:
   /// map from buffer value to its storage entry info
   DenseMap<Value, StorageEntry *> buffer2storageEntry;
 
+  /// stable IR order for Values used to keep memory planning deterministic.
+  StableValueOrderMap stableValueOrder;
+
   /// Memory dma pipe first plan optimization.
   OptMemPlanForDma dmaFirstPipelineOpt;
 
@@ -701,6 +753,9 @@ private:
 
   /// record inplace pair list.
   SmallVector<ValuePair> inplacePairList;
+
+  /// record semantic conflict pair list.
+  SmallVector<ValuePair> semanticConflictPairs;
 
   /// inplace-reuse info for the vf call.
   //VFCallInplaceReuseInfo *vfInplaceReuseInfo;
@@ -747,7 +802,6 @@ private:
   int scalingSpaceSize{0};
 
 };
-
 } // namespace pto
 } // namespace mlir
 

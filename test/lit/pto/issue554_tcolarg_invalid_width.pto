@@ -1,0 +1,17 @@
+// RUN: not ptoas --pto-arch=a3 %s 2>&1 | FileCheck %s --check-prefix=A3
+// RUN: not ptoas --pto-arch=a5 %s 2>&1 | FileCheck %s --check-prefix=A5
+
+module {
+  func.func @issue554_tcolargmax_i64_rejected() {
+    %src = pto.alloc_tile : !pto.tile_buf<loc=vec, dtype=i64, rows=16, cols=32, v_row=16, v_col=32, blayout=row_major, slayout=none_box, fractal=512, pad=0>
+    %tmp = pto.alloc_tile : !pto.tile_buf<loc=vec, dtype=i64, rows=16, cols=32, v_row=16, v_col=32, blayout=row_major, slayout=none_box, fractal=512, pad=0>
+    %dst = pto.alloc_tile : !pto.tile_buf<loc=vec, dtype=ui32, rows=1, cols=32, v_row=1, v_col=32, blayout=row_major, slayout=none_box, fractal=512, pad=0>
+
+    pto.tcolargmax ins(%src, %tmp : !pto.tile_buf<loc=vec, dtype=i64, rows=16, cols=32, v_row=16, v_col=32, blayout=row_major, slayout=none_box, fractal=512, pad=0>, !pto.tile_buf<loc=vec, dtype=i64, rows=16, cols=32, v_row=16, v_col=32, blayout=row_major, slayout=none_box, fractal=512, pad=0>)
+                   outs(%dst : !pto.tile_buf<loc=vec, dtype=ui32, rows=1, cols=32, v_row=1, v_col=32, blayout=row_major, slayout=none_box, fractal=512, pad=0>)
+    return
+  }
+}
+
+// A3: error: 'pto.tcolargmax' op expects src/tmp element type to be 1, 2, or 4 bytes wide
+// A5: error: 'pto.tcolargmax' op expects src element type to be 1, 2, or 4 bytes wide
