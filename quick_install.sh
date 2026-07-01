@@ -8,7 +8,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 # For quick development, build and install ptoas and its python bindings 
-# on top of Docker image https://github.com/learning-chip/agent_docker_npu/pull/8
+# on top of Docker image https://github.com/learning-chip/agent_docker_npu/pull/11
 # assume MLIR is already installed to save time, takes <3min to finish the build of pto extension
 #
 # Optional env:
@@ -55,12 +55,14 @@ ninja -C build install
 
 export PTO_SOURCE_DIR PTO_INSTALL_DIR LLVM_BUILD_DIR
 export PTOAS_PYTHON_PACKAGE_VERSION="${PTOAS_PYTHON_PACKAGE_VERSION:-${PTOAS_VERSION}}"
+PTO_WHEEL_DIST_DIR="${PTO_WHEEL_DIST_DIR:-${PTO_SOURCE_DIR}/build/wheel-dist}"
+export PTO_WHEEL_DIST_DIR
 bash "${PTO_SOURCE_DIR}/docker/create_wheel.sh"
 
 shopt -s nullglob
-wheels=("${MLIR_PY_PKG}/dist/ptoas-"*.whl)
+wheels=("${PTO_WHEEL_DIST_DIR}/ptoas-"*.whl)
 shopt -u nullglob
-((${#wheels[@]} > 0)) || { echo "error: no ptoas-*.whl under ${MLIR_PY_PKG}/dist" >&2; exit 1; }
+((${#wheels[@]} > 0)) || { echo "error: no ptoas-*.whl under ${PTO_WHEEL_DIST_DIR}" >&2; exit 1; }
 pip install --force-reinstall "${wheels[0]}"
 
 export PATH="${PTO_SOURCE_DIR}/build/tools/ptoas:${PATH}"

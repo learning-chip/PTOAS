@@ -120,6 +120,20 @@ static std::optional<std::string> getEnvPath(llvm::StringRef name) {
   return std::string(env);
 }
 
+static std::string getBishengCompatibleHostCPUName(llvm::StringRef hostTriple) {
+  if (auto env = getEnvPath("PTOAS_HOST_TARGET_CPU"))
+    return *env;
+
+  // Bisheng's host frontend only supports a subset of LLVM target CPUs.
+  // Prefer portable defaults over llvm::sys::getHostCPUName(), which may
+  // return values such as znver4 that Bisheng cannot compile.
+  if (hostTriple.starts_with("x86_64"))
+    return "x86-64";
+  if (hostTriple.starts_with("aarch64"))
+    return "generic";
+  return llvm::sys::getHostCPUName().str();
+}
+
 static std::string joinPath(llvm::StringRef lhs, llvm::StringRef rhs) {
   llvm::SmallString<256> joined(lhs);
   llvm::sys::path::append(joined, rhs);
@@ -538,7 +552,7 @@ static bool compileHostStubToObject(llvm::StringRef stubPath,
       "-triple",
       hostTriple,
       "-target-cpu",
-      llvm::sys::getHostCPUName().str(),
+      getBishengCompatibleHostCPUName(hostTriple),
       "-fcce-aicpu-legacy-launch",
       "-fcce-is-host",
       "-cce-enable-mix",
