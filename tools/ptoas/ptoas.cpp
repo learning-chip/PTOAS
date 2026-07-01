@@ -1808,6 +1808,12 @@ static LogicalResult runVMISemanticPipeline(OwningOpRef<ModuleOp> &module) {
   PassManager pm(module->getContext());
   pm.enableVerifier();
   pm.addPass(pto::createPTOValidateVMIIRPass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+  pm.addPass(pto::createVMIPreAssignmentCombinePass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+  pm.addPass(pto::createVMILegalizeArithSelectPass());
   pm.addPass(pto::createVMILayoutAssignmentPass());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
