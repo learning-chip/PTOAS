@@ -5288,7 +5288,8 @@ LogicalResult VreluOp::verify() {
 LogicalResult VnotOp::verify() { return verifyUnaryVecOp(*this); }
 
 template <typename BinaryOp>
-static LogicalResult verifyBinaryVecOp(BinaryOp op) {
+static LogicalResult verifyBinaryVecOp(BinaryOp op,
+                                       bool allowLowPrecision = false) {
   if (failed(verifyVRegTypeLike(op, op.getLhs().getType(), "lhs type")))
     return failure();
   if (failed(verifyVRegTypeLike(op, op.getRhs().getType(), "rhs type")))
@@ -5297,7 +5298,8 @@ static LogicalResult verifyBinaryVecOp(BinaryOp op) {
     return failure();
   if (failed(verifyVRegTypeLike(op, op.getResult().getType(), "result type")))
     return failure();
-  if (failed(verifyNonLowPrecisionVRegElementTypeLike(
+  if (!allowLowPrecision &&
+      failed(verifyNonLowPrecisionVRegElementTypeLike(
           op.getOperation(), op.getLhs().getType(), "lhs type")))
     return failure();
   if (op.getLhs().getType() != op.getRhs().getType() ||
@@ -5311,7 +5313,9 @@ LogicalResult VsubOp::verify() { return verifyBinaryVecOp(*this); }
 LogicalResult VmulOp::verify() { return verifyBinaryVecOp(*this); }
 LogicalResult VdivOp::verify() { return verifyBinaryVecOp(*this); }
 LogicalResult VandOp::verify() { return verifyBinaryVecOp(*this); }
-LogicalResult VorOp::verify() { return verifyBinaryVecOp(*this); }
+LogicalResult VorOp::verify() {
+  return verifyBinaryVecOp(*this, /*allowLowPrecision=*/true);
+}
 LogicalResult VxorOp::verify() { return verifyBinaryVecOp(*this); }
 
 template <typename TernaryOp>

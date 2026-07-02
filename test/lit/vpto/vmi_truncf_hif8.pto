@@ -9,13 +9,23 @@
 // RUN: ptoas --pto-arch=a5 --pto-backend=vpto --enable-vmi --emit-vpto %s -o - 2>/dev/null | FileCheck %s
 
 // CHECK-LABEL: func.func @vmi_truncf_hif8_default_kernel
-// CHECK: pto.vcvt {{.*}} {part = "P0", rnd = "A", sat = "SAT"} : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256x!pto.hif8>
-// CHECK-NOT: part = "P1"
-// CHECK: pto.vsts {{.*}} {dist = "PK4_B32"} : !pto.vreg<256x!pto.hif8>, !pto.ptr<!pto.hif8, ub>, !pto.mask<b32>
+// CHECK: %[[A_P0:.*]] = pto.vcvt {{.*}} {part = "P0", rnd = "A", sat = "SAT"} : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256x!pto.hif8>
+// CHECK: %[[A_P1:.*]] = pto.vcvt {{.*}} {part = "P1", rnd = "A", sat = "SAT"} : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256x!pto.hif8>
+// CHECK: %[[A_P2:.*]] = pto.vcvt {{.*}} {part = "P2", rnd = "A", sat = "SAT"} : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256x!pto.hif8>
+// CHECK: %[[A_P3:.*]] = pto.vcvt {{.*}} {part = "P3", rnd = "A", sat = "SAT"} : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256x!pto.hif8>
+// CHECK: %[[A_M01:.*]] = pto.vor %[[A_P0]], %[[A_P1]], {{.*}} : !pto.vreg<256x!pto.hif8>, !pto.vreg<256x!pto.hif8>, !pto.mask<b8> -> !pto.vreg<256x!pto.hif8>
+// CHECK: %[[A_M012:.*]] = pto.vor %[[A_M01]], %[[A_P2]], {{.*}} : !pto.vreg<256x!pto.hif8>, !pto.vreg<256x!pto.hif8>, !pto.mask<b8> -> !pto.vreg<256x!pto.hif8>
+// CHECK: pto.vor %[[A_M012]], %[[A_P3]], {{.*}} : !pto.vreg<256x!pto.hif8>, !pto.vreg<256x!pto.hif8>, !pto.mask<b8> -> !pto.vreg<256x!pto.hif8>
+// CHECK: pto.vsts {{.*}} : !pto.vreg<256x!pto.hif8>, !pto.ptr<!pto.hif8, ub>, !pto.mask<b8>
 // CHECK-LABEL: func.func @vmi_truncf_hif8_hybrid_kernel
-// CHECK: pto.vcvt {{.*}} {part = "P0", rnd = "H", sat = "SAT"} : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256x!pto.hif8>
-// CHECK-NOT: part = "P1"
-// CHECK: pto.vsts {{.*}} {dist = "PK4_B32"} : !pto.vreg<256x!pto.hif8>, !pto.ptr<!pto.hif8, ub>, !pto.mask<b32>
+// CHECK: %[[H_P0:.*]] = pto.vcvt {{.*}} {part = "P0", rnd = "H", sat = "SAT"} : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256x!pto.hif8>
+// CHECK: %[[H_P1:.*]] = pto.vcvt {{.*}} {part = "P1", rnd = "H", sat = "SAT"} : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256x!pto.hif8>
+// CHECK: %[[H_P2:.*]] = pto.vcvt {{.*}} {part = "P2", rnd = "H", sat = "SAT"} : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256x!pto.hif8>
+// CHECK: %[[H_P3:.*]] = pto.vcvt {{.*}} {part = "P3", rnd = "H", sat = "SAT"} : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256x!pto.hif8>
+// CHECK: %[[H_M01:.*]] = pto.vor %[[H_P0]], %[[H_P1]], {{.*}} : !pto.vreg<256x!pto.hif8>, !pto.vreg<256x!pto.hif8>, !pto.mask<b8> -> !pto.vreg<256x!pto.hif8>
+// CHECK: %[[H_M012:.*]] = pto.vor %[[H_M01]], %[[H_P2]], {{.*}} : !pto.vreg<256x!pto.hif8>, !pto.vreg<256x!pto.hif8>, !pto.mask<b8> -> !pto.vreg<256x!pto.hif8>
+// CHECK: pto.vor %[[H_M012]], %[[H_P3]], {{.*}} : !pto.vreg<256x!pto.hif8>, !pto.vreg<256x!pto.hif8>, !pto.mask<b8> -> !pto.vreg<256x!pto.hif8>
+// CHECK: pto.vsts {{.*}} : !pto.vreg<256x!pto.hif8>, !pto.ptr<!pto.hif8, ub>, !pto.mask<b8>
 
 module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<vector>} {
   func.func @vmi_truncf_hif8_default_kernel(%src_gm: !pto.ptr<f32, gm>,
