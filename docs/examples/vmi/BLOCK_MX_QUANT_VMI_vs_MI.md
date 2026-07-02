@@ -20,6 +20,20 @@ input, and **f16 → fp8 E4M3** quant execution using a precomputed reciprocal
 scale. DMA shells differ between the full-kernel VMI quant example and the
 compute-only MI/CCE excerpts; this doc focuses on the **vector compute bodies**.
 
+**Reader contract:** after reading this note, you should be able to connect the
+scale/quant equations to the VMI source, predict the main MI/CCE lowering shape
+(`DINTLV`, `part`, `vintlv`, `PK4_B32`, masks), and identify which lines are
+algorithmic math versus register-layout repair.
+
+**Concrete VF tile used by the simulator examples:** the correctness tests use
+`rowNum=32`, `colBlockSize=256`, `ubBlockSize=32`, and
+`vlForHalfNumber=128`. That means each input row is `256` bf16/f16 values
+(`512` bytes), there are `8` scale groups per row (`256/32`), `scale1` occupies
+`32*32=1024` bytes, `scale2` occupies `256` bytes, and reciprocal scale occupies
+`16` uint16 lanes (`32` bytes). Wall-time configs also list
+`(rowNum,colBlockSize)=(4,64),(16,128),(32,256)`, but the local vector pipeline
+is written around the 256-lane row contract.
+
 This document is intentionally honest: VMI is a large win on the quant path and
 a solid win on scale computation, but it does not remove tiling, stride math, or
 pipeline synchronization.
@@ -144,7 +158,80 @@ Instruction behavior and caveats:
   `PK4_B32`; those are layout decisions derived from the value type and assigned
   physical layout.
 
-### 3.1 MI details algorithm engineers should not have to memorize
+### 3.1 How to use the side-by-side snippets
+
+When reading the scale and quant walkthroughs, tag each instruction by role:
+
+| Role | Question to ask | MX examples |
+|------|-----------------|-------------|
+| **MATH** | Does this change the numeric value? | `max`, `select`, `mulf`, scale encode |
+| **TYPE** | Does this change dtype while preserving logical lane `i`? | `extf`, `truncf`, `trunci`, `vcvt`, `vpack` |
+| **LAYOUT** | Does this only move bits/lanes? | `DINTLV_B16`, `PART_EVEN/ODD`, `vintlv`, `PK4_B32`, `vselr` |
+| **MEMORY** | Does this cross the UB/register boundary? | `load`, `store`, `masked_store`, `vlds`, `vsts` |
+
+The VMI source tries to keep **MATH** and **TYPE** visible. MI/CCE show every
+**LAYOUT** and **MEMORY** step because the author is working directly against
+the 256-byte physical register model.
+
+### 3.2 Expected lowering shapes for recurring VMI ops
+
+These are review expectations for the concrete examples, not a promise that each
+VMI op lowers to one MI instruction.
+
+**256-lane f16 row load + widen in the quant path:**
+
+```mlir
+%x_f16 = pto.vmi.load %x_ub[%row_off] : ... -> !pto.vmi.vreg<256xf16>
+%x_f32 = pto.vmi.extf %x_f16 : ... -> !pto.vmi.vreg<256xf32>
+```
+
+Expected MI/CCE shape:
+
+```mlir
+%x0, %x1 = pto.vldsx2 %xHalf[%row_off], "DINTLV_B16" : ...
+%x0_even = pto.vcvt %x0, %mask16 {part = "EVEN"} : ... -> !pto.vreg<64xf32>
+%x0_odd  = pto.vcvt %x0, %mask16 {part = "ODD"}  : ... -> !pto.vreg<64xf32>
+// ... same for x1, then vintlv repair before contiguous fp8 conversion ...
+```
+
+`extf` means “produce f32 lane `i` for every logical `x[i]`.” The lowered MI
+must split the 512-byte row, widen four physical streams, and repair layout.
+
+**fp32 → fp8 narrow + store:**
+
+```mlir
+%y_fp8 = pto.vmi.truncf %scaled : ... -> !pto.vmi.vreg<256xf8E4M3FN>
+pto.vmi.masked_store %y_fp8, %y_ub[%row_off], %mask : ...
+```
+
+Expected MI/CCE shape:
+
+```mlir
+%p0 = pto.vcvt %chunk0, %mask32 {part = "P0", rnd = "R", sat = "SAT"} : ...
+%p0_u8 = pto.vbitcast %p0 : ...
+pto.vsts %p0_u8, %y_ub[%row_off], %mask8 {dist = "PK4_B32"} : ...
+// repeated for byte offsets 64, 128, 192
+```
+
+`truncf` preserves logical lane order and target FP8 semantics; `PK4_B32` is the
+physical byte extraction needed to materialize dense UB bytes.
+
+**Scale-byte narrowing:**
+
+```mlir
+%scale_u8 = pto.vmi.trunci %scale_u16 : ... -> !pto.vmi.vreg<256xui8>
+```
+
+Expected MI/CCE shape:
+
+```mlir
+%scale_u8 = pto.vpack %scale_u16, "LOWER" : !pto.vreg<128xi16> -> !pto.vreg<256xui8>
+```
+
+The VMI surface says “keep the low 8 bits per logical lane”; MI spells the
+physical pack operation and later masks the first 8 meaningful scale bytes.
+
+### 3.3 MI details algorithm engineers should not have to memorize
 
 These are the hardware subtleties VMI is designed to hide in MX quant:
 
@@ -171,7 +258,23 @@ mixes `b16`, `b32`, and `b8` in one loop body.
 VMI replaces these with “load 256 f16”, “extend to fp32”, “multiply”, “truncate
 to fp8”, and “store”.
 
-### 3.2 Physical register model (the 256-byte contract)
+### 3.4 Common bugs VMI helps avoid
+
+- **Dropping one layout repair step:** after `DINTLV_B16` and `PART_EVEN/ODD`,
+  four f32 streams hold stride-4 logical indices. Skipping a `vintlv` produces a
+  byte-exact but lane-permuted FP8 row.
+- **Using the wrong `part` on FP8 cast:** the CCE/MI FP8 path writes into
+  `PART_P0` before `PK4_B32`; another part changes which byte the store packs.
+- **Wrong `PK4_B32` byte offset:** the four stores cover offsets
+  `0,64,128,192`; a wrong offset aliases or gaps a quarter row.
+- **Mask-family drift:** scale code mixes `b16` and `b8`; quant code mixes
+  `b16`, `b32`, and `b8`. VMI keeps a logical active-lane mask and lowering picks
+  the concrete predicate family.
+- **Confusing `vcgmax` with ordinary max:** `vcgmax` is a grouped lane reduction
+  with layout side effects. VMI names this as `group_reduce_maxi` plus
+  `group_broadcast`, making the reduction boundary easier to review.
+
+### 3.5 Physical register model (the 256-byte contract)
 
 Every A5 vector register is **256 bytes (2048 bits)** wide. That single fact
 drives almost all layout ceremony in block MX quant.
@@ -209,7 +312,7 @@ type, preserve logical index `i`.”** They do **not** mean the hardware perform
 one instruction. The compiler lowers them to the `vcvt` / `vintlv` / `vsts`
 sequence appropriate for the assigned physical layout.
 
-### 3.3 DINTLV load — first split (256 f16 → 2×128 f16)
+### 3.6 DINTLV load — first split (256 f16 → 2×128 f16)
 
 UB memory holds one quant row as **256 contiguous f16**:
 
@@ -241,7 +344,7 @@ VMI `vmi.load` returns `vreg<256×f16>` — the split still happens in lowered
 MI, but the VMI type + layout metadata record the inverse map
 (`even_reg[k]→2k`, `odd_reg[k]→2k+1`).
 
-### 3.4 PART_EVEN / PART_ODD widen — second split (each 128×f16 → 2×64×f32)
+### 3.7 PART_EVEN / PART_ODD widen — second split (each 128×f16 → 2×64×f32)
 
 Widen f16→f32 doubles element width: 128 f16 (256 B) → 128 f32 (512 B). The
 hardware writes widened results into **two 64×f32 registers** using part
@@ -271,7 +374,7 @@ memory order `[0,1,2,3,…]`.
 four `vcvt {part=EVEN/ODD}` plus (depending on the next op) relayout. The
 author never names `x0Zero0` or chooses which part applies to which DINTLV half.
 
-### 3.5 `vintlv` — rebuilding logical order (four steps on 256 elements)
+### 3.8 `vintlv` — rebuilding logical order (four steps on 256 elements)
 
 `vintlv(src0, src1)` interleaves **lane-by-lane** from two source registers into
 two destination registers. Within a 128-element local window it turns
@@ -323,7 +426,7 @@ multiply and repair at store time with `vstsx2 … INTLV_B32` instead of four
 `vintlv` (Pack-Unpack reference §4.2). The MI demo chooses **repair-then-`PART_P0`**
 because it matches the CCE `ComputeY1ToFP8` FP16 branch structure.
 
-### 3.6 PART_P0 + PK4_B32 — FP8 narrow and store (third layout axis)
+### 3.9 PART_P0 + PK4_B32 — FP8 narrow and store (third layout axis)
 
 After the `vintlv` chain, each 64×f32 register holds **64 contiguous logical
 values**. FP8 output still needs two more physical transforms:
@@ -424,7 +527,7 @@ Instruction-by-instruction:
   the comparison/select relation.
 
 **Physical layout note:** the scale path never widens to f32 per element, so it
-does **not** need the four-quadrant `vintlv` chain from §3.5. It still pays the
+does **not** need the four-quadrant `vintlv` chain from §3.8. It still pays the
 **DINTLV load tax**: `acc0` owns exponent maxima for logical indices
 `0,2,4,…,254` and `acc1` for `1,3,5,…,255`. `vcgmax` fuses reduction with
 broadcast only **within each mask family** (`b16`), so the dual-accumulator
@@ -714,10 +817,25 @@ Be explicit about remaining low-level work:
 | Debug wrong FP8 lanes / PK offsets / padding | Lowered **MI** (VMI hides the failure point) |
 | Learn DINTLV + part + PK rules hands-on | **MI** + `PTO-Gym-vmi/docs/PTO-micro-ISA-Pack-Unpack-Interleave-Part-Reference.md` |
 
+**Review checklist for VMI MX quant code:**
+
+1. Confirm the logical vector width matches the row contract (`256` lanes for
+   the covered scale and quant bodies).
+2. Confirm scale math still spells special cases explicitly: Inf/NaN, zero,
+   clamp/range handling, and reciprocal edge cases.
+3. Confirm dtype transitions match the intended stage: `extf` before fp32
+   multiply, `truncf` for FP8/FP4 output, and `trunci` for compact scale bytes.
+4. Inspect lowered MI for the expected `DINTLV_B16` split, `PART_EVEN/ODD`
+   widen, `vintlv` repair, `PART_P0` FP8 cast, and four `PK4_B32` stores on the
+   f16→fp8 path.
+5. Compare against `bmx_cce_kernels.h` when debugging: start at the
+   `Expected UB effect` block, then the register allocation and phase comments
+   for `ComputeOcp`, `ComputeDdr`, `ComputeY1ToFP4`, or `ComputeY1ToFP8`.
+
 **Suggested reading order:**
 
 1. Section 1 of this doc (math)
-2. **§3.2–§3.6** (physical register model — read before MI/CCE examples)
+2. **§3.5–§3.9** (physical register model — read before MI/CCE examples)
 3. `mx_block_quant_y1_fp8_f16_e4m3.vmi.pto` — best “before/after” showcase
 4. **§6.5–§6.9** (quant pipeline index map + VMI vs MI diagrams)
 5. `mx_block_quant_y1_fp8_f16_e4m3.mi.pto` — see what VMI removed
@@ -736,7 +854,7 @@ Be explicit about remaining low-level work:
 | Closer to math? | **Yes** — VMI keeps “max exponent → scale → multiply → cast” visible |
 | Easier than CCE? | **Yes for compute bodies**; **tie** for DMA/tiling |
 | Biggest win? | **f16→fp8 quant**, where MI spends most lines on layout repair |
-| Why `extf`/`truncf` vs `vintlv`? | VMI ops preserve **logical index `i`**; MI `vintlv` repairs **physical lane placement** after DINTLV + PART widen (§3.3–§3.6, §6.5–§6.7) |
+| Why `extf`/`truncf` vs `vintlv`? | VMI ops preserve **logical index `i`**; MI `vintlv` repairs **physical lane placement** after DINTLV + PART widen (§3.6–§3.9, §6.5–§6.7) |
 
 VMI is not “MX quant in five lines.” It is **MX quant with the split/part/PK
 contract moved into the compiler** — most valuable exactly where block quant
