@@ -1,0 +1,166 @@
+module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
+  module attributes {pto.backend = "vpto", pto.kernel_kind = #pto.kernel_kind<vector>, pto.target_arch = "a5"} {
+    func.func @ComputeY1ToFP8_f16_e4m3(
+        %dataLen: i16,
+        %blockCount: i16,
+        %xAddr: !pto.ptr<ui16, ub>,
+        %mxScale1ReciprocalAddr: !pto.ptr<ui16, ub>,
+        %y1Addr: !pto.ptr<ui8, ub>,
+        %ubBlockSize: i16,
+        %vlForHalfNumber: i16) attributes {pto.kernel} {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %c64 = arith.constant 64 : index
+      %c128 = arith.constant 128 : index
+      %c192 = arith.constant 192 : index
+
+      %block_count = arith.index_cast %blockCount : i16 to index
+      %vl_half = arith.index_cast %vlForHalfNumber : i16 to index
+      %block_stride = arith.muli %vl_half, %c2 : index
+      %xHalf = pto.castptr %xAddr : !pto.ptr<ui16, ub> -> !pto.ptr<f16, ub>
+
+      // ========================================================================
+      // MI 版本 - Block MX Quant f16->fp8_e4m3 量化执行路径 (硬件细节完整暴露)
+      //
+      // MI 层与底层向量 intrinsic 是 1:1 对应关系——每条 pto 指令对应一个硬件操作。
+      // 开发者需要理解和处理以下所有硬件细节:
+      //
+      //   1. DINTLV_B16 交错加载: 256个f16被拆成low(128,偶数索引)+high(128,奇数索引)
+      //   2. EVEN/ODD part 选择: f16->f32时 low 和 high 各自再拆 EVEN/ODD -> 4路f32交织
+      //   3. mask 粒度管理: b16(load/vcvt) / b32(vmul) / b32(vcvt/vsts) 三种分别维护
+      //   4. vintlv 交织重排: 多次 vintlv 将4路f32重新编排为P0~P3的打包顺序
+      //   5. P0 part + rnd/sat: f32->fp8时显式指定part=P0和舍入/饱和参数
+      //   6. vbitcast + PK4_B32: 类型重解释 + 硬件打包写回
+      //
+      // loop body 共计 17 条指令, 其中 12 条与量化算法无关, 纯粹描述硬件拆分/拼接。
+      // ========================================================================
+
+      pto.vecscope {
+        // MI: 需要三种 mask 粒度 - b16(load/vcvt), b32(vmul/vcvt/vsts)。
+        // 每条 mask 指令创建的 mask 只能用于对应位宽的操作, 选错粒度 = 数据错误。
+        // 对比 VMI: vmi.create_mask (统一 vmi.mask<256xpred>, 编译器管理粒度)。
+
+        %pregAllB16 = pto.pset_b16 "PAT_ALL" : !pto.mask<b16>
+        %pregAllB32 = pto.pset_b32 "PAT_ALL" : !pto.mask<b32>
+
+        // MI: vlds + E2B_B16 加载 reciprocal scale。E2B 分布模式将 128 个 bf16
+        // 按每 2 元素一组广播到 256 宽的寄存器中。后续需 vbitcast ui16->bf16 再 vcvt。
+
+        %scaleForMulBits = pto.vlds %mxScale1ReciprocalAddr[%c0] {dist = "E2B_B16"}
+          : !pto.ptr<ui16, ub> -> !pto.vreg<128xui16>
+        // MI: vbitcast 类型重解释 ui16->bf16, 然后 vcvt + PART_EVEN 取有效 bf16 转 f32。
+        // 因为 E2B_B16 排布, 有效数据在 EVEN 半区, 选 ODD 读到 0。
+
+        %scaleForMulBF16 = pto.vbitcast %scaleForMulBits : !pto.vreg<128xui16> -> !pto.vreg<128xbf16>
+        %scaleForMulFP32 = pto.vcvt %scaleForMulBF16, %pregAllB16 {part = "EVEN"}
+          : !pto.vreg<128xbf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+
+        scf.for %i = %c0 to %block_count step %c1 {
+          %blockBase = arith.muli %i, %block_stride : index
+          %yOff1 = arith.addi %blockBase, %c64 : index
+          %yOff2 = arith.addi %blockBase, %c128 : index
+          %yOff3 = arith.addi %blockBase, %c192 : index
+
+          // ========================================================================
+          // MI loop body - 每次处理 256 个 f16 元素, 共 17 条指令
+          // 数据流: DINTLV_B16 load -> 4x vcvt EVEN/ODD -> 4x vmul -> 2x vintlv ->
+          //          2x vintlv(交错合并) -> 4x vcvt P0+rnd/sat -> 4x vsts PK4_B32
+          // ========================================================================
+          //
+          // (1) MI: vldsx2 + DINTLV_B16 交错加载 - 256 个 f16 被拆成:
+          //     x0F16(128, 偶数索引 [0,2,4,...,254])
+          //     x1F16(128, 奇数索引 [1,3,5,...,255])
+          //     为什么加载就要拆? 物理寄存器只有 256B 宽, 装不下 256 个 f16 (512B)。
+          //     对比 VMI: vmi.load -> vreg<256xf16> (逻辑连续, 编译器管理拆分)。
+
+          %x0F16, %x1F16 = pto.vldsx2 %xHalf[%blockBase], "DINTLV_B16"
+            : !pto.ptr<f16, ub>, index -> !pto.vreg<128xf16>, !pto.vreg<128xf16>
+
+          // (2) MI: f16->f32 - x0F16(128xf16) 再拆 EVEN/ODD:
+          //     x0Zero0 = vcvt(x0F16, PART_EVEN) -> 64xf32 = 元素[0,4,8,...]
+          //     x0One0  = vcvt(x0F16, PART_ODD)  -> 64xf32 = 元素[2,6,10,...]
+          //     为什么又要拆? f16(16bit)->f32(32bit) 位宽翻倍, 128个f32需要两个物理寄存器。
+          //     同理 x1F16(奇数索引,128xf16) 也拆 EVEN/ODD -> 共 4 路 f32。
+
+          %x0Zero0 = pto.vcvt %x0F16, %pregAllB16 {part = "EVEN"}
+            : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+          %x0One0 = pto.vcvt %x0F16, %pregAllB16 {part = "ODD"}
+            : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+          // (3) MI: 4 条 vmul 分别乘 reciprocal scale - 每条必须绑定 mask<b32>。
+          //     因为第(2)步已拆成 4 路 f32, 乘法也只能 4 路独立进行。
+          //     对比 VMI: 1 条 vmi.mulf (无 mask 参数)。
+
+          %x0Zero1 = pto.vmul %x0Zero0, %scaleForMulFP32, %pregAllB32
+            : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+          %x0One1 = pto.vmul %x0One0, %scaleForMulFP32, %pregAllB32
+            : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+          // (4) MI: vintlv 交织合并 - 将 x0Zero1 和 x0One1 交替穿插。
+          //     目的是把同一路 x0 的 EVEN/ODD 子块合并回去, 为后续 P0~P3 打包做准备。
+          //     同理 x1 路也做 vintlv。
+
+          %x0Zero2, %x0One2 = pto.vintlv %x0Zero1, %x0One1
+            : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
+
+          %x1Zero0 = pto.vcvt %x1F16, %pregAllB16 {part = "EVEN"}
+            : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+          %x1One0 = pto.vcvt %x1F16, %pregAllB16 {part = "ODD"}
+            : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+          %x1Zero1 = pto.vmul %x1Zero0, %scaleForMulFP32, %pregAllB32
+            : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+          %x1One1 = pto.vmul %x1One0, %scaleForMulFP32, %pregAllB32
+            : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+          %x1Zero2, %x1One2 = pto.vintlv %x1Zero1, %x1One1
+            : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
+
+          // (5) MI: 跨路 vintlv - 将 x0 路和 x1 路的 zero 子块交替穿插, ones 同理。
+          //     结果为 4 路 f32, 顺序满足 P0/P1/P2/P3 打包要求。
+
+          %x0Zero, %x1Zero = pto.vintlv %x0Zero2, %x1Zero2
+            : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
+          %x0One, %x1One = pto.vintlv %x0One2, %x1One2
+            : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
+
+          // (6) MI: f32->fp8_e4m3 - 4 条 vcvt, 每条需显式指定:
+          //     rnd=R   = round to nearest even (舍入模式)
+          //     sat=SAT = saturation (饱和溢出处理)
+          //     part=P0 = 打入 P0 打包通道 (4 路分别打入 P0/P1/P2/P3)
+          //     为什么分 P0~P3? fp8 每元素 8bit, 256-bit 寄存器装 32 个 fp8。
+          //     256 个 fp8 需 8 个寄存器, 按 part 分组打包。rnd/sat 用错会产生数值误差。
+          //     对比 VMI: 1 条 vmi.truncf (编译器自动填入 rnd/sat 并管理 part)。
+
+          %x0ZeroFP8 = pto.vcvt %x0Zero, %pregAllB32 {rnd = "R", sat = "SAT", part = "P0"}
+            : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256xf8E4M3FN>
+          %x0ZeroU8 = pto.vbitcast %x0ZeroFP8 : !pto.vreg<256xf8E4M3FN> -> !pto.vreg<256xui8>
+          // (7) MI: vsts + PK4_B32 打包写回 - 每条 store 前需 vbitcast fp8->ui8。
+          //     PK4_B32 指示硬件将 4 个 8-bit 元素打包为一个 32-bit 单元写出。
+          //     4 条 vsts 分别写回 P0/P1/P2/P3 四个 64 字节块, 地址依次偏移 64/128/192。
+          //     对比 VMI: 1 条 vmi.masked_store (编译器自动处理 bitcast+pack+地址计算)。
+
+          pto.vsts %x0ZeroU8, %y1Addr[%blockBase], %pregAllB32 {dist = "PK4_B32"}
+            : !pto.vreg<256xui8>, !pto.ptr<ui8, ub>, !pto.mask<b32>
+
+          %x0OneFP8 = pto.vcvt %x1Zero, %pregAllB32 {rnd = "R", sat = "SAT", part = "P0"}
+            : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256xf8E4M3FN>
+          %x0OneU8 = pto.vbitcast %x0OneFP8 : !pto.vreg<256xf8E4M3FN> -> !pto.vreg<256xui8>
+          pto.vsts %x0OneU8, %y1Addr[%yOff1], %pregAllB32 {dist = "PK4_B32"}
+            : !pto.vreg<256xui8>, !pto.ptr<ui8, ub>, !pto.mask<b32>
+
+          %x1ZeroFP8 = pto.vcvt %x0One, %pregAllB32 {rnd = "R", sat = "SAT", part = "P0"}
+            : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256xf8E4M3FN>
+          %x1ZeroU8 = pto.vbitcast %x1ZeroFP8 : !pto.vreg<256xf8E4M3FN> -> !pto.vreg<256xui8>
+          pto.vsts %x1ZeroU8, %y1Addr[%yOff2], %pregAllB32 {dist = "PK4_B32"}
+            : !pto.vreg<256xui8>, !pto.ptr<ui8, ub>, !pto.mask<b32>
+
+          %x1OneFP8 = pto.vcvt %x1One, %pregAllB32 {rnd = "R", sat = "SAT", part = "P0"}
+            : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256xf8E4M3FN>
+          %x1OneU8 = pto.vbitcast %x1OneFP8 : !pto.vreg<256xf8E4M3FN> -> !pto.vreg<256xui8>
+          pto.vsts %x1OneU8, %y1Addr[%yOff3], %pregAllB32 {dist = "PK4_B32"}
+            : !pto.vreg<256xui8>, !pto.ptr<ui8, ub>, !pto.mask<b32>
+        }
+      }
+
+      return
+    }
+  }
+}

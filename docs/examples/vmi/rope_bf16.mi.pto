@@ -1,0 +1,245 @@
+module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
+  module attributes {pto.backend = "vpto", pto.kernel_kind = #pto.kernel_kind<vector>, pto.target_arch = "a5"} {
+    func.func @rope_mi_bf16(
+        %x_gm16: !pto.ptr<ui16, gm>,
+        %cos_gm16: !pto.ptr<ui16, gm>,
+        %sin_gm16: !pto.ptr<ui16, gm>,
+        %y_gm16: !pto.ptr<ui16, gm>,
+        %sCount: i32,
+        %nCount: i32,
+        %mode: i32) attributes {pto.kernel} {
+      %false = arith.constant false
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2_i64 = arith.constant 2 : i64
+      %c31_i64 = arith.constant 31 : i64
+      %c32_i64 = arith.constant 32 : i64
+      %c64 = arith.constant 64 : index
+      %c0_i32 = arith.constant 0 : i32
+      %c0_i64 = arith.constant 0 : i64
+      %c1_i64 = arith.constant 1 : i64
+
+      %x_gm = pto.castptr %x_gm16 : !pto.ptr<ui16, gm> -> !pto.ptr<bf16, gm>
+      %cos_gm = pto.castptr %cos_gm16 : !pto.ptr<ui16, gm> -> !pto.ptr<f16, gm>
+      %sin_gm = pto.castptr %sin_gm16 : !pto.ptr<ui16, gm> -> !pto.ptr<f16, gm>
+      %y_gm = pto.castptr %y_gm16 : !pto.ptr<ui16, gm> -> !pto.ptr<bf16, gm>
+
+      %s_count = arith.index_cast %sCount : i32 to index
+      %n_count = arith.index_cast %nCount : i32 to index
+      %cos_elems = arith.muli %s_count, %c64 : index
+      %xy_rows = arith.muli %s_count, %n_count : index
+      %xy_elems = arith.muli %xy_rows, %c64 : index
+
+      %cos_elems_i64 = arith.index_cast %cos_elems : index to i64
+      %xy_elems_i64 = arith.index_cast %xy_elems : index to i64
+      %cos_bytes = arith.muli %cos_elems_i64, %c2_i64 : i64
+      %xy_bytes = arith.muli %xy_elems_i64, %c2_i64 : i64
+
+      %cos_lines = arith.addi %cos_bytes, %c31_i64 : i64
+      %cos_lines_q = arith.divui %cos_lines, %c32_i64 : i64
+      %cos_dma_bytes = arith.muli %cos_lines_q, %c32_i64 : i64
+
+      %xy_lines = arith.addi %xy_bytes, %c31_i64 : i64
+      %xy_lines_q = arith.divui %xy_lines, %c32_i64 : i64
+      %xy_dma_bytes = arith.muli %xy_lines_q, %c32_i64 : i64
+
+      %sin_ub_off = arith.addi %cos_dma_bytes, %c0_i64 : i64
+      %x_ub_off = arith.addi %cos_dma_bytes, %cos_dma_bytes : i64
+      %y_ub_off = arith.addi %x_ub_off, %xy_dma_bytes : i64
+
+      %cos_ub = pto.castptr %c0_i64 : i64 -> !pto.ptr<f16, ub>
+      %sin_ub = pto.castptr %sin_ub_off : i64 -> !pto.ptr<f16, ub>
+      %x_ub = pto.castptr %x_ub_off : i64 -> !pto.ptr<bf16, ub>
+      %y_ub = pto.castptr %y_ub_off : i64 -> !pto.ptr<bf16, ub>
+
+      pto.copy_gm_to_ubuf %cos_gm, %cos_ub, %c0_i64, %c1_i64, %cos_dma_bytes, %c0_i64, %c0_i64, %false, %c0_i64, %cos_dma_bytes, %cos_dma_bytes : !pto.ptr<f16, gm>, !pto.ptr<f16, ub>, i64, i64, i64, i64, i64, i1, i64, i64, i64
+      pto.copy_gm_to_ubuf %sin_gm, %sin_ub, %c0_i64, %c1_i64, %cos_dma_bytes, %c0_i64, %c0_i64, %false, %c0_i64, %cos_dma_bytes, %cos_dma_bytes : !pto.ptr<f16, gm>, !pto.ptr<f16, ub>, i64, i64, i64, i64, i64, i1, i64, i64, i64
+      pto.copy_gm_to_ubuf %x_gm, %x_ub, %c0_i64, %c1_i64, %xy_dma_bytes, %c0_i64, %c0_i64, %false, %c0_i64, %xy_dma_bytes, %xy_dma_bytes : !pto.ptr<bf16, gm>, !pto.ptr<bf16, ub>, i64, i64, i64, i64, i64, i1, i64, i64, i64
+
+      pto.set_flag[<PIPE_MTE2>, <PIPE_V>, <EVENT_ID0>]
+      pto.wait_flag[<PIPE_MTE2>, <PIPE_V>, <EVENT_ID0>]
+
+      %x_s_step = arith.muli %n_count, %c64 : index
+      %x_n_step = arith.addi %c64, %c0 : index
+      %cs_s_step = arith.addi %c64, %c0 : index
+      %y_s_step = arith.muli %n_count, %c64 : index
+      %y_n_step = arith.addi %c64, %c0 : index
+      %is_half_mode = arith.cmpi eq, %mode, %c0_i32 : i32
+
+      // ========================================================================
+      // MI 版本 — RoPE bf16 向量计算路径（硬件细节完整暴露）
+      //
+      // bf16 MI 版本最明显地体现了硬件细节负担：cos/sin 为 f16，x/y 为 bf16，
+      // 必须统一提升到 f32 计算再截断回 bf16。这一过程在 MI 层暴露了完整的
+      // 硬件链路：
+      //
+      //   UNPK_B16 load  ─→  vcvt PART_EVEN  ─→  f32 compute
+      //        ↑ 128宽寄存器只装64个有效数据     ↑ 必须选对 EVEN part
+      //
+      //   vcvt PART_EVEN + rnd/sat  ─→  vsts PK_B32 store
+      //        ↑ 必须手写舍入/饱和参数              ↑ 硬件打包写回
+      //
+      // 每一步都要求开发者理解底层硬件的数据排布和转换协议。
+      // ========================================================================
+
+      pto.vecscope {
+        //   UNPK_B16 load -> PART_EVEN widen -> fp32 compute ->
+        //   PART_EVEN narrow -> PK_B32 store.
+        // The loop shape is also intentionally the same: s -> rep/blk -> n.
+        scf.if %is_half_mode {
+          // MI: 需要两种 mask——pset_b16 用于 load/vcvt 的 b16 操作，
+          // pge_b32 用于 f32 算术的 b32 操作。不同数据类型无法共用 mask。
+          // VMI 对应: vmi.create_mask（统一 vmi.mask<Nxpred>）。
+
+          %mask16_all = pto.pset_b16 "PAT_ALL" : !pto.mask<b16>
+          %mask32_half = pto.pge_b32 "PAT_VL32" : !pto.mask<b32>
+          scf.for %s = %c0 to %s_count step %c1 {
+            %x_s_off = arith.muli %s, %x_s_step : index
+            %cs_off = arith.muli %s, %cs_s_step : index
+            %y_s_off = arith.muli %s, %y_s_step : index
+            %cs_hi_off = arith.addi %cs_off, %c32 : index
+
+            // MI: vlds + UNPK_B16 解包加载——64个 f16 数据被拆开放到
+            // 128xf16 寄存器的 EVEN 位置，ODD 位置填 0。
+            // 后续 vcvt {part = "EVEN"} 才能取出有效数据，选 ODD 读到 0。
+            // VMI 对应: vmi.load（逻辑向量 64xf16，编译器自动处理排布）。
+
+            %cos_lo_16 = pto.vlds %cos_ub[%cs_off] {dist = "UNPK_B16"} : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+            %sin_lo_16 = pto.vlds %sin_ub[%cs_off] {dist = "UNPK_B16"} : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+            %cos_hi_16 = pto.vlds %cos_ub[%cs_hi_off] {dist = "UNPK_B16"} : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+            %sin_hi_16 = pto.vlds %sin_ub[%cs_hi_off] {dist = "UNPK_B16"} : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+
+            // only the EVEN halfword positions carry valid data
+            // after UNPK_B16, so all widening conversions use PART_EVEN.
+            // MI: vcvt + PART_EVEN——必须指定 EVEN part 才能从 UNPK_B16 的
+            // 128xf16 寄存器中取出有效的 64 个 f16 并转为 f32。
+            // 选错 part 意味着取到填充的 0（ODD）或错位数据。
+            // VMI 对应: vmi.extf（编译器追踪数据来源，自动选对 part）。
+
+            %cos_lo = pto.vcvt %cos_lo_16, %mask16_all {part = "EVEN"} : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+            %sin_lo = pto.vcvt %sin_lo_16, %mask16_all {part = "EVEN"} : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+            %cos_hi = pto.vcvt %cos_hi_16, %mask16_all {part = "EVEN"} : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+            %sin_hi = pto.vcvt %sin_hi_16, %mask16_all {part = "EVEN"} : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+
+            scf.for %n = %c0 to %n_count step %c1 {
+              %x_n_off = arith.muli %n, %x_n_step : index
+              %y_n_off = arith.muli %n, %y_n_step : index
+              %x_off = arith.addi %x_s_off, %x_n_off : index
+              %y_off = arith.addi %y_s_off, %y_n_off : index
+              %x_hi_off = arith.addi %x_off, %c32 : index
+              %y_hi_off = arith.addi %y_off, %c32 : index
+
+              // MI: bf16 load 同样用 UNPK_B16——64个 bf16 解包到 128xbf16 的 EVEN。
+              // VMI 对应: vmi.load（64xbf16 逻辑向量）。
+
+              %x_lo_16 = pto.vlds %x_ub[%x_off] {dist = "UNPK_B16"} : !pto.ptr<bf16, ub> -> !pto.vreg<128xbf16>
+              %x_hi_16 = pto.vlds %x_ub[%x_hi_off] {dist = "UNPK_B16"} : !pto.ptr<bf16, ub> -> !pto.vreg<128xbf16>
+              %x_lo = pto.vcvt %x_lo_16, %mask16_all {part = "EVEN"} : !pto.vreg<128xbf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+              %x_hi = pto.vcvt %x_hi_16, %mask16_all {part = "EVEN"} : !pto.vreg<128xbf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+
+              // Half layout: two independent 32-element halves are rotated against each other.
+              // ========================================================================
+              // Half 模式 RoPE 核心计算 — MI bf16 版本（f32 精度）
+              // 公式: y_lo_f32 = cos_lo*x_lo - sin_lo*x_hi
+              //       y_hi_f32 = cos_hi*x_hi + sin_hi*x_lo
+              //
+              // MI: 每条 vmul/vsub/vadd 绑定 mask<b32>（f32 运算专用掩码）。
+              // 4条乘 + 2条加减 = 6条指令，mask 重复携带。
+              // VMI 对应: vmi.mulf/subf/addf（无 mask 参数）。
+              // ========================================================================
+
+              %t0 = pto.vmul %cos_lo, %x_lo, %mask32_half : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %t1 = pto.vmul %sin_lo, %x_hi, %mask32_half : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %y_lo_f32 = pto.vsub %t0, %t1, %mask32_half : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+
+              %t2 = pto.vmul %cos_hi, %x_hi, %mask32_half : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %t3 = pto.vmul %sin_hi, %x_lo, %mask32_half : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %y_hi_f32 = pto.vadd %t2, %t3, %mask32_half : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+
+              // Narrow back to bf16 in EVEN slots, then PACK_B32 back to dense UB layout.
+              %y_lo_16 = pto.vcvt %y_lo_f32, %mask32_half {part = "EVEN", rnd = "R", sat = "SAT"} : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<128xbf16>
+              %y_hi_16 = pto.vcvt %y_hi_f32, %mask32_half {part = "EVEN", rnd = "R", sat = "SAT"} : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<128xbf16>
+
+              // MI: vsts + PK_B32 打包写回——EVEN 位置的有效 bf16 需要硬件
+              // 打包成内存中连续的 32 个元素。错误使用普通 store 会混入 ODD 的无效数据。
+              // VMI 对应: vmi.masked_store（编译器自动选择打包策略）。
+
+              pto.vsts %y_lo_16, %y_ub[%y_off], %mask32_half {dist = "PK_B32"} : !pto.vreg<128xbf16>, !pto.ptr<bf16, ub>, !pto.mask<b32>
+              pto.vsts %y_hi_16, %y_ub[%y_hi_off], %mask32_half {dist = "PK_B32"} : !pto.vreg<128xbf16>, !pto.ptr<bf16, ub>, !pto.mask<b32>
+            }
+          }
+        } else {
+          %mask16_all = pto.pset_b16 "PAT_ALL" : !pto.mask<b16>
+          %mask32_all = pto.pset_b32 "PAT_ALL" : !pto.mask<b32>
+          scf.for %s = %c0 to %s_count step %c1 {
+            %x_s_off = arith.muli %s, %x_s_step : index
+            %cs_off = arith.muli %s, %cs_s_step : index
+            %y_s_off = arith.muli %s, %y_s_step : index
+
+            %cos16 = pto.vlds %cos_ub[%cs_off] {dist = "UNPK_B16"} : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+            %sin16 = pto.vlds %sin_ub[%cs_off] {dist = "UNPK_B16"} : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+            %cos = pto.vcvt %cos16, %mask16_all {part = "EVEN"} : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+            %sin = pto.vcvt %sin16, %mask16_all {part = "EVEN"} : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+            // deinterleave -> build rotated partner -> y = x*cos + rot(x)*sin.
+            // This PTO spelling keeps the same pairwise result while showing
+            // the even/odd streams explicitly.
+            // MI: vdintlv 硬件解交织 cos/sin——拆出 even/odd 用于成对计算。
+            // 输入两个相同寄存器（cos, cos），输出 even/odd 两个半宽寄存器。
+            // VMI 对应: channel_split。
+
+            %cos_even, %cos_odd = pto.vdintlv %cos, %cos : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
+            %sin_even, %sin_odd = pto.vdintlv %sin, %sin : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
+
+            scf.for %n = %c0 to %n_count step %c1 {
+              %x_n_off = arith.muli %n, %x_n_step : index
+              %y_n_off = arith.muli %n, %y_n_step : index
+              %x_off = arith.addi %x_s_off, %x_n_off : index
+              %y_off = arith.addi %y_s_off, %y_n_off : index
+
+              %x16 = pto.vlds %x_ub[%x_off] {dist = "UNPK_B16"} : !pto.ptr<bf16, ub> -> !pto.vreg<128xbf16>
+              %x = pto.vcvt %x16, %mask16_all {part = "EVEN"} : !pto.vreg<128xbf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+              // MI: vdintlv 解交织 x，拆出 even/odd。
+              // VMI 对应: channel_split。
+
+              %x_even, %x_odd = pto.vdintlv %x, %x : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
+
+              // Explicit even/odd RoPE equations:
+              // y_even = x_even * cos_even - x_odd * sin_even
+              // y_odd  = x_odd  * cos_odd  + x_even * sin_odd
+              // ========================================================================
+              // MI: 成对 RoPE 计算——8条算术指令 + mask<b32>。
+              // 4条 vmul + 2条 vsub + 2条 vadd。
+              // VMI 对应: 6条 vmi.mulf/subf/addf（无 mask）。
+              // ========================================================================
+
+              %x_even_cos = pto.vmul %x_even, %cos_even, %mask32_all : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %x_odd_sin = pto.vmul %x_odd, %sin_even, %mask32_all : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %y_even = pto.vsub %x_even_cos, %x_odd_sin, %mask32_all : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+
+              %x_odd_cos = pto.vmul %x_odd, %cos_odd, %mask32_all : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %x_even_sin = pto.vmul %x_even, %sin_odd, %mask32_all : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %y_odd = pto.vadd %x_odd_cos, %x_even_sin, %mask32_all : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+
+              // MI: vintlv 硬件交织 even/odd 回交织格式。
+              // 产出两个寄存器，y_pack 存低半、y_pack_hi 存高半。
+              // VMI 对应: channel_merge（单个 vreg<128> 输出）。
+
+              %y_pack, %y_pack_hi = pto.vintlv %y_even, %y_odd : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
+              %y_pack_16 = pto.vcvt %y_pack, %mask32_all {part = "EVEN", rnd = "R", sat = "SAT"} : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<128xbf16>
+              // MI: vsts + PK_B32 打包写回。
+              // VMI 对应: vmi.masked_store。
+
+              pto.vsts %y_pack_16, %y_ub[%y_off], %mask32_all {dist = "PK_B32"} : !pto.vreg<128xbf16>, !pto.ptr<bf16, ub>, !pto.mask<b32>
+            }
+          }
+        }
+      }
+
+      pto.set_flag[<PIPE_V>, <PIPE_MTE3>, <EVENT_ID0>]
+      pto.wait_flag[<PIPE_V>, <PIPE_MTE3>, <EVENT_ID0>]
+      pto.copy_ubuf_to_gm %y_ub, %y_gm, %c0_i64, %c1_i64, %xy_dma_bytes, %c0_i64, %xy_dma_bytes, %xy_dma_bytes : !pto.ptr<bf16, ub>, !pto.ptr<bf16, gm>, i64, i64, i64, i64, i64, i64
+      pto.barrier <PIPE_ALL>
+      return
+    }
+  }
+}

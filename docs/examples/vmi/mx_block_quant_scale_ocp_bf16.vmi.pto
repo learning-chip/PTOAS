@@ -1,0 +1,238 @@
+module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
+  module attributes {pto.backend = "vpto", pto.kernel_kind = #pto.kernel_kind<vector>, pto.target_arch = "a5"} {
+    func.func @ComputeOcp_bf16(
+        %rowNum: i16,
+        %colBlockSize: i32,
+        %xAddr: !pto.ptr<ui16, ub>,
+        %mxScale1Addr: !pto.ptr<ui8, ub>,
+        %mxScale2Addr: !pto.ptr<ui8, ub>,
+        %mxScaleReciprocalAddr: !pto.ptr<ui16, ub>,
+        %gatherIndexAddr: !pto.ptr<ui8, ub>,
+        %yMaxExp: i16,
+        %ubBlockSize: i16,
+        %vlForHalfNumber: i16) attributes {pto.kernel} {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %c7_i32 = arith.constant 7 : i32
+      %c64 = arith.constant 64 : index
+      %c256 = arith.constant 256 : index
+      %c0_i16 = arith.constant 0 : i16
+      %c0_i32 = arith.constant 0 : i32
+      %c64_i16 = arith.constant 64 : i16
+      %c255_i32 = arith.constant 255 : i32
+      %c32512_i16 = arith.constant 32512 : i16
+      %c32640_i16 = arith.constant 32640 : i16
+      %c32641_i16 = arith.constant 32641 : i16
+
+      %row_count = arith.index_cast %rowNum : i16 to index
+      %ub_block = arith.index_cast %ubBlockSize : i16 to index
+      %vl_half = arith.index_cast %vlForHalfNumber : i16 to index
+      %load_stride = arith.muli %vl_half, %c2 : index
+
+      // ========================================================================
+      // VMI - Block MX Quant Scale OCP bf16 (语义级抽象)
+      //
+      // 算法流程: 逐行加载 bf16 数据 -> 提取指数 -> 逐元素求 max -> 跨行归约求全局 amax
+      //   -> 计算 scale(含 inf/nan/zero/special 边界处理) -> 写入 scale1/scale2/reciprocal
+      //
+      // VMI 相比 MI 的核心简化:
+      //
+      //   MI 写法                                VMI 写法
+      //   --------------------------------       --------------------------------
+      //   vldsx2 + DINTLV_B16 拆成 2路128         vmi.load 逻辑向量 256
+      //   vbr 广播常量到 128 宽                    vmi.broadcast 广播到 256 宽
+      //   2个独立累加器 (因 DINTLV 拆分)            1个累加器 (逻辑连续向量)
+      //   vand/vcmp/vsel/vsub + mask<b16>         vmi.andi/cmpi/select/subi (无mask)
+      //   vcgmax 隐式归约+广播                      group_reduce_maxi + group_broadcast 显式两步
+      //   vpack LOWER 打包字节                      vmi.trunci 语义截断
+      //   vsts + NORM_B8/B16 + mask<b8/b16>       vmi.store (无mask, 无dist模式)
+      //   pset_b16/pge_b8/pge_b16 多种mask         vmi.create_mask 统一mask类型
+      //
+      // ========================================================================
+
+      pto.vecscope {
+        // VMI: create_mask 逻辑长度 256 创建统一 mask。
+        // MI 对应: pset_b16 + pset_b8 + pge_b8 + pge_b16 四种 mask, 选错粒度即 bug。
+
+        %mask256 = pto.vmi.create_mask %c256 : index -> !pto.vmi.mask<256xpred>
+        // VMI: vmi.broadcast 广播标量到 256-wide 向量, 替代 MI 的 vbr(128-wide)。
+        // MI 中这些常量(expMask/yMaxExp/bias/nan等) 均为 vreg<128xi16>,
+        // 因 DINTLV_B16 拆出的两路各需要独立的常量寄存器。VMI 统一为 256 宽。
+
+        %zero16 = pto.vmi.broadcast %c0_i16 : i16 -> !pto.vmi.vreg<256xi16>
+        %zero32 = pto.vmi.broadcast %c0_i32 : i32 -> !pto.vmi.vreg<256xi32>
+        %expMaskBF16 = pto.vmi.broadcast %c32640_i16 : i16 -> !pto.vmi.vreg<256xi16>
+        %yMaxExpReg = pto.vmi.broadcast %yMaxExp : i16 -> !pto.vmi.vreg<256xi16>
+        %biasE8M0 = pto.vmi.broadcast %c32512_i16 : i16 -> !pto.vmi.vreg<256xi16>
+        %specialExp = pto.vmi.broadcast %c64_i16 : i16 -> !pto.vmi.vreg<256xi16>
+        %nanBF16 = pto.vmi.broadcast %c32641_i16 : i16 -> !pto.vmi.vreg<256xi16>
+        %nanE8M0_32 = pto.vmi.broadcast %c255_i32 : i32 -> !pto.vmi.vreg<256xi32>
+        %shift32 = pto.vmi.broadcast %c7_i32 : i32 -> !pto.vmi.vreg<256xi32>
+
+        %expMaxRows16 = scf.for %i = %c0 to %row_count step %c1
+            iter_args(%acc = %zero16) -> (!pto.vmi.vreg<256xi16>) {
+          %loadOffset = arith.muli %i, %load_stride : index
+          // VMI: vmi.load 加载 256 个 bf16 (作为 ui16), 逻辑连续。
+          // MI 对应: vldsx2 + DINTLV_B16 -> 两个 vreg<128xbf16>, 偶数/奇数索引分离。
+
+          %xBitsU16 = pto.vmi.load %xAddr[%loadOffset]
+            : !pto.ptr<ui16, ub> -> !pto.vmi.vreg<256xui16>
+          // VMI: bitcast + andi 提取指数位 (bf16 指数在位[14:7])。
+          // MI 对应: vbitcast bf16->i16 + vand %mask<b16>——需要显式 mask。
+
+          %xBits = pto.vmi.bitcast %xBitsU16
+            : !pto.vmi.vreg<256xui16> -> !pto.vmi.vreg<256xi16>
+          %xExp = pto.vmi.andi %xBits, %expMaskBF16
+            : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
+            -> !pto.vmi.vreg<256xi16>
+          // VMI: cmpi + select 实现逐元素取 max——无 mask 参数。
+          // MI 对应: vmax %acc0, %x0ExpBF16, %pregAllB16——需要 mask<b16>。
+          //   注意 MI 用硬件 vmax 指令, VMI 用 cmpi+select 组合——语义等价, 但 MI 的 vmax
+          //   仍然需要 mask 参数而 VMI 的 cmpi/select 不需要。
+
+          %takeNew = pto.vmi.cmpi "slt", %acc, %xExp
+            : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
+            -> !pto.vmi.mask<256xpred>
+          %nextAcc = pto.vmi.select %takeNew, %xExp, %acc
+            : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi16>,
+              !pto.vmi.vreg<256xi16>
+            -> !pto.vmi.vreg<256xi16>
+          scf.yield %nextAcc : !pto.vmi.vreg<256xi16>
+        }
+
+        // ========================================================================
+        // 阶段2: 跨行归约 - 将逐行 max 结果在 lane 维度上做全局 reduce_max
+        //
+        // VMI: extsi 将 i16 符号扩展为 i32, 然后 group_reduce_maxi 显式归约到
+        //   标量 (vreg<1xi32>), 再用 group_broadcast 显式广播回 256 宽。
+        //   两步分离使数据流清晰: 归约 -> 广播, 各自独立控制。
+        // MI 对应: vcgmax 隐式完成归约+广播——单条指令, 但归约结果和广播范围不可分离。
+        // ========================================================================
+
+        %expMaxRows32 = pto.vmi.extsi %expMaxRows16
+          : !pto.vmi.vreg<256xi16> -> !pto.vmi.vreg<256xi32>
+        %expMaxScalar32 = pto.vmi.group_reduce_maxi %expMaxRows32, %mask256 {num_groups = 1}
+          : !pto.vmi.vreg<256xi32>, !pto.vmi.mask<256xpred>
+          -> !pto.vmi.vreg<1xi32>
+        %expMaxDim32 = pto.vmi.group_broadcast %expMaxScalar32 {num_groups = 1}
+          : !pto.vmi.vreg<1xi32> -> !pto.vmi.vreg<256xi32>
+        %expMaxDim0 = pto.vmi.trunci %expMaxDim32
+          : !pto.vmi.vreg<256xi32> -> !pto.vmi.vreg<256xi16>
+
+        // ========================================================================
+        // 阶段3: scale 计算 - 边界值处理 (inf/nan/zero/special) + 移位生成 E8M0 scale
+        //
+        // 算法: if isLeYMax -> clamp to yMaxExp; exp = exp - yMaxExp; scale = exp >> 7
+        //        if isInfOrNan -> scale = nanE8M0; if isZero -> scale = 0
+        //
+        // VMI: cmpi/select/subi/shrui 均为无 mask 指令, 逻辑清晰。
+        // MI 对应: vcmp/vsel/vsub/vshrs——每条都需 mask<b16>。
+        // ========================================================================
+
+        %isInfOrNan = pto.vmi.cmpi "eq", %expMaxDim0, %expMaskBF16
+          : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
+          -> !pto.vmi.mask<256xpred>
+        %isZero = pto.vmi.cmpi "eq", %expMaxDim0, %zero16
+          : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
+          -> !pto.vmi.mask<256xpred>
+        %isLeYMax = pto.vmi.cmpi "ge", %yMaxExpReg, %expMaxDim0
+          : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
+          -> !pto.vmi.mask<256xpred>
+        %expMaxDim1 = pto.vmi.select %isLeYMax, %yMaxExpReg, %expMaxDim0
+          : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi16>,
+            !pto.vmi.vreg<256xi16>
+          -> !pto.vmi.vreg<256xi16>
+        %expMaxDim2 = pto.vmi.subi %expMaxDim1, %yMaxExpReg
+          : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
+          -> !pto.vmi.vreg<256xi16>
+
+        %expMaxShift32 = pto.vmi.extsi %expMaxDim2
+          : !pto.vmi.vreg<256xi16> -> !pto.vmi.vreg<256xi32>
+        %mxScaleI32_0 = pto.vmi.shrui %expMaxShift32, %shift32
+          : !pto.vmi.vreg<256xi32>, !pto.vmi.vreg<256xi32>
+          -> !pto.vmi.vreg<256xi32>
+        %mxScaleI32_1 = pto.vmi.select %isInfOrNan, %nanE8M0_32, %mxScaleI32_0
+          : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi32>,
+            !pto.vmi.vreg<256xi32>
+          -> !pto.vmi.vreg<256xi32>
+        %mxScaleI32_2 = pto.vmi.select %isZero, %zero32, %mxScaleI32_1
+          : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi32>,
+            !pto.vmi.vreg<256xi32>
+          -> !pto.vmi.vreg<256xi32>
+        // VMI: trunci 语义截断 i32->ui8, 一举替代 MI 的 vpack LOWER 指令。
+        // MI 对应: vpack %mxScaleB16_2, "LOWER" -> vreg<256xui8>。
+        //   vpack 需要指定 LOWER/UPPER 半区, 开发者需理解 bf16 高低位关系。
+
+        %mxScale1Full = pto.vmi.trunci %mxScaleI32_2
+          : !pto.vmi.vreg<256xi32> -> !pto.vmi.vreg<256xui8>
+
+        // 16 bf16 words for reciprocal.
+        // VMI: group_reduce_maxi(num_groups=64) 将 256 宽按 64 组归约 -> 64 个 scale1 字节。
+        //     不同于前面的全规约(num_groups=1), 这里每 4 lane 归约出一个 scale1 字节。
+
+        %mxScale1Rows32 = pto.vmi.group_reduce_maxi %mxScaleI32_2, %mask256 {num_groups = 64}
+          : !pto.vmi.vreg<256xi32>, !pto.vmi.mask<256xpred>
+          -> !pto.vmi.vreg<64xi32>
+        %mxScale1Rows = pto.vmi.trunci %mxScale1Rows32
+          : !pto.vmi.vreg<64xi32> -> !pto.vmi.vreg<64xui8>
+
+        scf.for %i = %c0 to %row_count step %c1 {
+          %scaleOff = arith.muli %i, %ub_block : index
+          // VMI: vmi.store 直接写回——无 dist 模式, 无 mask 参数。
+          // MI 对应: vsts + {dist="NORM_B8"} + mask<b8>。
+
+          pto.vmi.store %mxScale1Rows, %mxScale1Addr[%scaleOff]
+            : !pto.vmi.vreg<64xui8>, !pto.ptr<ui8, ub>
+        }
+
+        // VMI: scale2 直接写回完整的 256 字节。vselr(gather) 在归约广播后所有 lane
+        //   值相同, gatherIndex 不影响结果, 因此 VMI 直接用 scale1Full 写入。
+        // MI 对应: vlds gatherIndex -> vselr(mxScale1, gatherIndex) -> vsts NORM_B8。
+
+        pto.vmi.store %mxScale1Full, %mxScale2Addr[%c0]
+          : !pto.vmi.vreg<256xui8>, !pto.ptr<ui8, ub>
+
+        // ========================================================================
+        // 阶段4: reciprocal scale 计算 - reversed = bias - exp, 含边界处理
+        // VMI: subi + select 链 (inf/nan -> nan, zero -> 0, invalid -> special)
+        // MI 对应: vsub + vsel 链——每条带 mask<b16>。
+        // ========================================================================
+
+        %invalidRecipMask = pto.vmi.cmpi "eq", %expMaxDim2, %biasE8M0
+          : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
+          -> !pto.vmi.mask<256xpred>
+        %reversedShareExp0 = pto.vmi.subi %biasE8M0, %expMaxDim2
+          : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
+          -> !pto.vmi.vreg<256xi16>
+        %reversedShareExp1 = pto.vmi.select %isInfOrNan, %nanBF16, %reversedShareExp0
+          : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi16>,
+            !pto.vmi.vreg<256xi16>
+          -> !pto.vmi.vreg<256xi16>
+        %reversedShareExp2 = pto.vmi.select %isZero, %zero16, %reversedShareExp1
+          : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi16>,
+            !pto.vmi.vreg<256xi16>
+          -> !pto.vmi.vreg<256xi16>
+        %reversedShareExp3 = pto.vmi.select %invalidRecipMask, %specialExp, %reversedShareExp2
+          : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi16>,
+            !pto.vmi.vreg<256xi16>
+          -> !pto.vmi.vreg<256xi16>
+
+        %reversedShareExp32 = pto.vmi.extsi %reversedShareExp3
+          : !pto.vmi.vreg<256xi16> -> !pto.vmi.vreg<256xi32>
+        %reversedRows32 = pto.vmi.group_reduce_maxi %reversedShareExp32, %mask256 {num_groups = 16}
+          : !pto.vmi.vreg<256xi32>, !pto.vmi.mask<256xpred>
+          -> !pto.vmi.vreg<16xi32>
+        %reversedRows = pto.vmi.trunci %reversedRows32
+          : !pto.vmi.vreg<16xi32> -> !pto.vmi.vreg<16xui16>
+        // VMI: group_reduce_maxi(num_groups=16) 归约到 16 个 bf16 reciprocal 值, 写入 UB。
+        // MI 对应: vsts + {dist="NORM_B16"} + mask<b16> + vbitcast i16->ui16。
+
+        pto.vmi.store %reversedRows, %mxScaleReciprocalAddr[%c0]
+          : !pto.vmi.vreg<16xui16>, !pto.ptr<ui16, ub>
+      }
+
+      return
+    }
+  }
+}
