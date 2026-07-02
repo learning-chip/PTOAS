@@ -134,6 +134,206 @@ mapping. Correct for performance, opaque for reading.
 VMI replaces these with “load 64 bf16”, “extend to fp32”, “store bf16”, and
 “split/merge even/odd channels”.
 
+### 3.2 Physical register model (256-byte contract, D=64 demo)
+
+Every A5 vector register is **256 bytes**. The RoPE examples process one head row
+of **D=64** elements per inner tile. How those 64 elements map to physical
+registers depends on **dtype** and **layout mode**:
+
+| Case | Memory bytes (64 elems) | Typical physical reg | Load `dist` |
+|------|-------------------------|----------------------|-------------|
+| f16 / fp16 dense | 128 B | `vreg<128×f16>` (64 active lanes) | `NORM` |
+| bf16 dense | 128 B | `vreg<128×bf16>` after UNPK | `UNPK_B16` |
+| f32 dense | 256 B | `vreg<64×f32>` | `NORM` |
+| GPT-J interleaved (all dtypes) | same as above | one dense reg, then parity split | as above + `vdintlv` |
+
+**Logical view (VMI):** `!pto.vmi.vreg<64×T>` or `!pto.vmi.vreg<128×T>` means
+elements `0..N−1` in algorithm order. HALF mode treats indices `[0..D/2−1]` and
+`[D/2..D−1]` as **partner halves**. INTERLEAVE mode treats `(2k, 2k+1)` as
+**rotation pairs**.
+
+**Physical view (MI/CCE):** each register has **lane slots** with placement
+rules. UNPK, `part=EVEN/ODD`, `vdintlv`/`vintlv`, and `PK_B32` are not math —
+they maintain the mapping between lane slot and logical index.
+
+RoPE at D=64 is **smaller** than block MX quant (256-wide rows), so you rarely
+need `DINTLV_B16` split loads in these examples. The dominant layout axes here
+are **UNPK/PK** (bf16), **parity shuffle** (INTERLEAVE), and **mask family**
+(b16 vs b32).
+
+See also `BLOCK_MX_QUANT_VMI_vs_MI.md` §3.2–§3.6 for the same 256B contract
+applied to 256-element quant rows (where `DINTLV` + four `vintlv` steps appear).
+
+### 3.3 UNPK_B16 load and PK_B32 store (bf16 / fp16 dense paths)
+
+bf16 RoPE loads **64 dense halfwords** from UB, but a b16 register holds
+**128 lanes**. `UNPK_B16` expands each memory element into an **even physical
+lane**, leaving odd lanes as zero/padding:
+
+```
+Memory (32 dense bf16 in one HALF tile, D/2=32):
+  [b0, b1, b2, ..., b31]   ← 64 bytes
+
+After UNPK_B16 → vreg<128×bf16> (256 B):
+  phys lane:  0    1    2    3    4  ...  62   63   64  ... 127
+  holds:      b0   __   b1   __   b2  ...  b31  __   __  ...  __
+              ↑ even only; odd lanes are padding
+```
+
+**Widen:** `vcvt {part=EVEN}` reads lanes `0,2,4,…,126` → **64×f32** register
+with the 32 meaningful values in the active mask lanes. Using `part=ODD` would
+read the padding lanes and produce garbage — CCE documents this explicitly in
+`ComputeBf16`.
+
+**Narrow + store:** `vcvt {part=EVEN}` writes fp32 results back into even b16
+lanes, then `vsts {dist=PK_B32}` extracts even lanes and packs them into **dense
+memory**:
+
+```
+After PART_EVEN narrow → vreg<128×bf16>:
+  [y0, __, y1, __, y2, __, ...]
+
+PK_B32 store → memory:
+  [y0, y1, y2, ...]   ← dense again
+```
+
+**VMI:** `vmi.load` → `vreg<64×bf16>`, `vmi.extf` / `vmi.truncf`, `vmi.masked_store`.
+The UNPK → EVEN → PK chain is compiler lowering, not author code.
+
+### 3.4 HALF mode — contiguous halves (NeoX layout)
+
+HALF mode splits **D=64** into two partner blocks of **32 elements** each. No
+parity deinterleave is required — partners are already contiguous in memory:
+
+```
+Logical head row (D=64):
+  x[0..31]  = low half (x1)     partner with  x[32..63] = high half (x2)
+
+Memory layout (HALF):
+  ┌─────────────────┬─────────────────┐
+  │  x[0] … x[31]   │ x[32] … x[63]   │
+  └─────────────────┴─────────────────┘
+     load x_lo          load x_hi  (+halfD or +halfD_aligned offset)
+```
+
+**f16 / f32 HALF (dense):** each half fits in one register. MI loads
+`vreg<128×f16>` with a **32-lane tail mask** (`pge_b16 "PAT_VL32"` or dynamic
+`plt_b16` in v2). Only the low 32 physical lanes hold data; the register is
+128-wide because that is the native b16 vector width.
+
+**bf16 HALF:** each half uses UNPK (§3.3) + fp32 compute + PK store. MI needs
+**two mask families** in one loop body: `mask<b16>` for UNPK load and PART_EVEN
+widen of cos/sin, `mask<b32>` for fp32 `vmul`/`vsub`/`vadd`.
+
+**Physical register picture (bf16 HALF, one partner half):**
+
+```
+cos_lo_16  ──UNPK──► [c0,__,c1,__,…] ──PART_EVEN──► cos_lo (64×f32, 32 active)
+x_lo_16    ──UNPK──► [x0,__,x1,__,…] ──PART_EVEN──► x_lo  (64×f32, 32 active)
+                              │
+                              ├── vmul / vsub / vadd  (mask<b32>)
+                              ▼
+y_lo_f32 (64×f32) ──PART_EVEN narrow──► [y0,__,y1,__,…] ──PK_B32──► dense UB
+```
+
+VMI names the same math on logical `vreg<64×bf16>` / `vreg<64×f32>` without
+ exposing the even-lane landing zone.
+
+### 3.5 INTERLEAVE mode — parity axis (GPT-J layout)
+
+GPT-J layout stores rotation pairs as **adjacent elements**:
+
+```
+Logical (D=64 interleaved):
+  [x0, x1,  x2, x3,  x4, x5, ... x62, x63]
+   └── pair 0 ──┘  └── pair 1 ──┘
+```
+
+Hardware `vdintlv` / `vintlv` implement the **parity axis** — the same axis
+used by `PART_EVEN`/`PART_ODD` on widen, but here applied to **already-widened
+or dense b16/f16 vectors** to separate even- and odd-indexed streams:
+
+```
+Dense reg x (128 lanes, 64 active interleaved):
+  [x0, x1, x2, x3, x4, x5, x6, x7, ...]
+
+vdintlv(x, x) →
+  x_even: [x0, x2, x4, x6, ...]     ← even logical indices
+  x_odd:  [x1, x3, x5, x7, ...]     ← odd logical indices
+```
+
+**Complex-multiply form** (CCE, `rope_f16_v2.mi.pto`, f16/bf16 VMI): build
+`(i·x)` in interleaved layout without splitting cos/sin:
+
+```
+x_even, x_odd = vdintlv(x)
+neg_x_odd     = x_odd * (-1)
+x_rot, _      = vintlv(neg_x_odd, x_even)   → [-x1, x0, -x3, x2, ...]
+
+y = x*cos + x_rot*sin                     ← 3 arithmetic ops on dense regs
+```
+
+Physical effect of `vintlv(neg_x_odd, x_even)` (8-element sketch):
+
+```
+neg_x_odd:  [-x1, -x3, -x5, -x7]
+x_even:     [ x0,  x2,  x4,  x6]
+
+x_rot:      [-x1, x0, -x3, x2, -x5, x4, -x7, x6]   ← interleaved (i·x)
+```
+
+**Cartesian expansion form** (MI v1, f32 VMI interleave): deinterleave **all**
+streams, compute even/odd updates separately, merge back:
+
+```
+cos_even, cos_odd = vdintlv(cos)
+sin_even, sin_odd = vdintlv(sin)
+x_even,   x_odd   = vdintlv(x)
+
+y_even = x_even*cos_even - x_odd*sin_even
+y_odd  = x_odd*cos_odd  + x_even*sin_odd
+
+y, _ = vintlv(y_even, y_odd)    ← re-pack to [y0,y1,y2,y3,...]
+```
+
+Same RoPE result; **more layout ops** in the Cartesian path (three `vdintlv` on
+tables + one `vintlv` repack vs one `vdintlv` + one `vintlv` on `x` only).
+
+**VMI mapping:**
+
+| MI/CCE | VMI | Physical meaning |
+|--------|-----|------------------|
+| `vdintlv` | `channel_split` | dense → even/odd parity streams |
+| `vintlv` | `channel_merge` | even/odd → dense interleaved |
+| `vmul` + `vbr(-1)` | `negf` | negate odd stream |
+
+### 3.6 Mask families and predicate width
+
+MI RoPE kernels often carry **two predicate granularities** in one loop:
+
+| Mask type | Used for | Example |
+|-----------|----------|---------|
+| `!pto.mask<b16>` | UNPK loads, b16 `vcvt`, dense f16 `vmul`, `plt_b16` tails | bf16 load/widen; f16 interleave |
+| `!pto.mask<b32>` | fp32 `vmul`/`vsub`/`vadd`, PART_EVEN narrow, `PK_B32` store | bf16 HALF compute body |
+
+A bf16 HALF loop typically creates **both** `%mask16_all` and `%mask32_half`.
+Using a b16 mask on a b32 op (or vice versa) is a silent wrong-lane bug.
+
+VMI uses one logical `!pto.vmi.mask<N×pred>` per tile; the compiler lowers to
+the correct `pset`/`plt`/`punpack` family.
+
+### 3.7 Variant → layout complexity (honest map)
+
+| Variant | Physical layout burden | Dominant MI ops beyond arithmetic |
+|---------|------------------------|-----------------------------------|
+| **f32 HALF** | Low | Tail mask only |
+| **f16 HALF** | Low | Tail mask; 128-wide reg, 32 active lanes |
+| **bf16 HALF** | **High** | UNPK, PART_EVEN ×2, PK_B32, dual masks |
+| **f16 INTERLEAVE v2** | Medium | `vdintlv`, `vbr`, `vintlv` on `x`; dense cos/sin |
+| **f16 INTERLEAVE v1** | **High** | `vdintlv` ×3, 8 arith, `vintlv` repack |
+| **bf16 INTERLEAVE** | **High** | UNPK/PK chain + parity shuffle in fp32 |
+| **f32 INTERLEAVE VMI** | Medium | Cartesian `channel_split/merge`; no UNPK |
+
 ---
 
 ## 4. Advantage by variant (ranked)
@@ -211,6 +411,20 @@ families.
 **CCE** (`ComputeBf16` HALF) documents the same protocol explicitly in comments
 — excellent for verification, heavy for authoring.
 
+**Physical layout (bf16 HALF, one 32-element partner half):**
+
+| Step | MI/CCE op | Register state (logical indices) |
+|------|-----------|----------------------------------|
+| 0 | UB memory | 32 dense bf16: `x[0..31]` or `x[32..63]` |
+| 1 | `vlds UNPK_B16` | 128×bf16 even lanes: phys `2k → x[k]` |
+| 2 | `vcvt PART_EVEN` | 64×f32: active lanes hold same 32 values |
+| 3 | `vmul` / `vsub` / `vadd` | fp32 partners combined (`mask<b32>`) |
+| 4 | `vcvt PART_EVEN` narrow | bf16 back into even lanes of 128×bf16 |
+| 5 | `vsts PK_B32` | dense 32 bf16 in UB |
+
+VMI collapses steps 1–2 into `vmi.load` + `vmi.extf`, steps 4–5 into
+`vmi.truncf` + `vmi.masked_store`.
+
 ---
 
 ### 5.2 bf16 INTERLEAVE — complex-multiply form in VMI
@@ -252,6 +466,33 @@ PK store. Correct, but the code looks like a shuffle kernel, not `y = x·cos +
 is closer to VMI structurally — but still uses `vbr`, `plt_b16`, and masked
 `vmul/vadd`.
 
+**Physical layout (bf16 INTERLEAVE, complex-multiply, one 64-element row):**
+
+```
+UB dense (64 bf16 interleaved):  x0 x1 x2 x3 ... x63
+        │ UNPK + PART_EVEN widen
+        ▼
+x (64×f32 logical, interleaved in one dense fp32 reg)
+        │ channel_split  ≡  vdintlv(x, x)
+        ├──────────────┬──────────────
+        ▼              ▼
+   x_even         x_odd        [x0,x2,...] [x1,x3,...]
+        │ negf         │
+        └──────┬───────┘
+               │ channel_merge(neg_odd, even)  ≡  vintlv
+               ▼
+   x_rot = [-x1,x0,-x3,x2,...]     cos, sin stay dense (no vdintlv)
+               │
+               └── mulf/addf:  y = x*cos + x_rot*sin
+                       │ truncf + PK
+                       ▼
+               dense bf16 interleaved out
+```
+
+Cartesian MI v1 instead runs `vdintlv` on cos/sin **and** x, performs eight
+masked ops on parity streams, then `vintlv(y_even, y_odd)` to rebuild interleaved
+output — see §3.5.
+
 ---
 
 ### 5.3 f16 HALF — moderate win
@@ -282,6 +523,20 @@ out2 = x2*cos + x1*sin
 VMI advantage here is **clarity, not algorithm**: masks and load/store dist
 modes disappear from the math block. Loop tiling (`rep`, `half_d_aligned`,
 dynamic tail) remains equally verbose in both.
+
+**Physical layout (f16 HALF):** partners are **two separate dense loads**, not a
+parity split. For D=64 with `halfD=32`:
+
+```
+x_lo reg (128×f16):  lanes 0..31 ← x[0..31]     (mask covers 32 lanes)
+x_hi reg (128×f16):  lanes 0..31 ← x[32..63]    (loaded from x + halfD_aligned)
+
+Six fp32-equivalent ops (native f16 here):
+  y_lo = cos_lo * x_lo - sin_lo * x_hi
+  y_hi = cos_hi * x_hi + sin_lo * x_lo
+```
+
+No `vdintlv`/`vintlv` — the NeoX layout already matches how HALF loads data.
 
 ---
 
@@ -316,6 +571,20 @@ vadd(htb, hta, htb, mask, MODE_ZEROING);
 Same story, different vocabulary: **merge(−odd, even)** vs **vintlv after
 negate**.
 
+**Index map for complex-multiply (8-element sketch, matches v2/CCE/VMI f16):**
+
+| Stage | Register | Logical contents |
+|-------|----------|------------------|
+| load | `x` | `[x0,x1,x2,x3,x4,x5,x6,x7]` |
+| `vdintlv` | `x_even` | `[x0,x2,x4,x6]` |
+| `vdintlv` | `x_odd` | `[x1,x3,x5,x7]` |
+| negate odd | `neg_x_odd` | `[-x1,-x3,-x5,-x7]` |
+| `vintlv` | `x_rot` | `[-x1,x0,-x3,x2,-x5,x4,-x7,x6]` |
+| `vmul` + `vadd` | `y` | `[y0,y1,…,y7]` interleaved |
+
+`cos` and `sin` remain **dense interleaved** throughout — unlike MI v1, which
+splits them with separate `vdintlv` calls.
+
 ---
 
 ### 5.5 f32 HALF — smallest win
@@ -342,6 +611,14 @@ pto.vmi.masked_store %out1, %y_ub[%y1_off], %mask : ...
 VMI still helps (uniform `vmi.load`, one mask type, no `pge_b32`), but this is
 not where you save days of debugging UNPK/PK issues.
 
+**Physical layout (f32 HALF):** the easy baseline — **64×f32 fits one register**
+(256 B). Load, compute, store are all `NORM` with no UNPK, part, or PK:
+
+```
+x1: vreg<64×f32> ← x[0..31]     x2: vreg<64×f32> ← x[32..63]
+        └── native fp32 vmul/vsub/vadd (mask<b32> for tail only)
+```
+
 ---
 
 ### 5.6 f32 INTERLEAVE — Cartesian form; moderate win
@@ -366,6 +643,41 @@ Note: CCE f32 INTERLEAVE uses the **complex-multiply** path (like f16 v2), so
 VMI f32 interleave is **not** a line-for-line spelling match to CCE — it is an
 equivalent Cartesian organization chosen for clarity at the logical vector
 width.
+
+**Physical layout (f32 INTERLEAVE Cartesian):**
+
+```
+x (64×f32 dense interleaved)
+  │ channel_split  ≡  vdintlv
+  ├─────────┬─────────
+  ▼         ▼
+x_even   x_odd     (+ same for cos, sin in MI v1; VMI splits x/cos/sin logically)
+  │ 4 muls + 2 subs/adds on streams
+  ▼
+y_even, y_odd
+  │ channel_merge  ≡  vintlv
+  ▼
+y dense interleaved
+```
+
+CCE f32 would instead keep cos/sin dense and use one `vdintlv`/`vintlv` pair on
+`x` only (complex-multiply form, same as §5.4 index table).
+
+---
+
+### 5.7 End-to-end layout comparison (all six variants)
+
+| Variant | Loads | Compute reg layout | Shuffle ops | Stores |
+|---------|-------|-------------------|-------------|--------|
+| f32 HALF | 2× dense 64×f32 | native dense | none | 2× dense |
+| f16 HALF | 2× dense 128×f16 (32 active) | native dense | none | 2× dense |
+| bf16 HALF | 4× UNPK + PART_EVEN widen | 4× 64×f32 | none | 2× PART_EVEN + PK_B32 |
+| f16 INT v2 | 3× dense 128×f16 | dense + parity on `x` | `vdintlv`+`vintlv` on `x` | 1× dense |
+| f16 INT v1 | 3× dense + 3× `vdintlv` | 6 parity streams | 3× `vdintlv`, 1× `vintlv` | 1× dense |
+| bf16 INT | UNPK + fp32 body | fp32 dense + parity | same as f16 v2 + PK | PK_B32 |
+
+**VMI value correlates with shuffle + UNPK/PK column width**, not with RoPE
+formula complexity (which is identical everywhere).
 
 ---
 
@@ -404,10 +716,14 @@ width.
 **Suggested reading order for new algorithm engineers:**
 
 1. Section 1 of this doc (math)
-2. `rope_bf16.vmi.pto` HALF loop body — best VMI showcase
-3. `rope_bf16.mi.pto` same section — see what VMI removed
-4. `rope_cce_compute.h` `ComputeBf16` — ground truth with educational comments
-5. `rope_f16_v2.mi.pto` — CCE-faithful MI reference for f16
+2. **§3.2–§3.7** (physical register model — read before MI/CCE examples)
+3. `rope_bf16.vmi.pto` HALF loop body — best VMI showcase
+4. **§5.7** (variant layout comparison table)
+5. `rope_bf16.mi.pto` same section — see what VMI removed
+6. `rope_cce_compute.h` `ComputeBf16` — ground truth with educational comments
+7. `rope_f16_v2.mi.pto` — CCE-faithful MI reference for f16
+8. `PTO-Gym-vmi/docs/PTO-micro-ISA-Pack-Unpack-Interleave-Part-Reference.md` — full layout taxonomy
+9. `BLOCK_MX_QUANT_VMI_vs_MI.md` — same layout axes at 256-wide quant scale
 
 ---
 
@@ -420,6 +736,7 @@ width.
 | Closer to math? | **Yes** where VMI hides UNPK/PK/part and uses `channel_split/merge` for GPT-J |
 | Easier than CCE? | **Yes for compute bodies**; **tie** for DMA/tiling shell |
 | Still worth it if MI is v2-quality? | **Yes for bf16**; **marginal for f32 HALF** |
+| Why UNPK / vdintlv / vintlv? | Physical 256B regs + dense vs interleaved memory; see §3.3–§3.5 |
 
 VMI is not “RoPE in three lines.” It is **RoPE with the hardware contract moved
 into the compiler** — most valuable exactly where that contract is longest:
@@ -442,6 +759,7 @@ into the compiler** — most valuable exactly where that contract is longest:
 
 Related docs:
 
+- `BLOCK_MX_QUANT_VMI_vs_MI.md` — same three-layer pattern; deeper DINTLV/`vintlv` at 256-wide
 - `PTO-Gym-vmi/docs/PTO-vmi-design.en.md`
 - `PTO-Gym-vmi/docs/PTO-micro-ISA-Pack-Unpack-Interleave-Part-Reference.md`
 - `PTO-Gym-vmi/docs/PTO-micro-Instruction-SPEC.md`
