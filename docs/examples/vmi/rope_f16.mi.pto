@@ -80,12 +80,34 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
       // ========================================================================
 
       pto.vecscope {
+        // Expected UB effect of this vecscope:
+        // - Inputs already in UB: x_ub contains f16 rows x[s,n,0..63];
+        //   cos_ub/sin_ub contain f16 RoPE tables for each s.
+        // - Output modified in UB: y_ub is overwritten with the RoPE-rotated f16 row.
+        // - mode == 0 (HALF/NeoX): for d in [0,32),
+        //     y[s,n,d]    = x[s,n,d]    * cos[s,d]    - x[s,n,d+32] * sin[s,d]
+        //     y[s,n,d+32] = x[s,n,d+32] * cos[s,d+32] + x[s,n,d]    * sin[s,d+32]
+        // - mode != 0 (INTERLEAVE/GPT-J): for pairs (2k,2k+1),
+        //     y_even = x_even*cos_even - x_odd*sin_even
+        //     y_odd  = x_odd *cos_odd  + x_even*sin_odd
+        // x_ub/cos_ub/sin_ub are read-only from the vector compute perspective.
+        // Instruction reading guide for this MI file:
+        // - pto.vlds/pto.vsts are direct UB <-> vector-register moves. In f16
+        //   NORM mode there is no UNPK/PK conversion, but the 256-byte physical
+        //   register is still 128 f16 lanes and the mask decides which lanes count.
+        // - pto.vmul/pto.vsub/pto.vadd are native f16 element-wise arithmetic;
+        //   each instruction explicitly consumes !pto.mask<b16>.
+        // - pto.vdintlv/pto.vintlv are layout instructions, not RoPE math:
+        //   they split and rebuild the even/odd interleaved pair structure.
+        // VMI equivalents are vmi.load, mask-free vmi.mulf/subf/addf, and
+        // channel_split/channel_merge on logical vectors.
         //   s loop -> hoisted cos/sin load -> per-head x load -> SIMD RoPE math -> store.
         scf.if %is_half_mode {
           // MI: pge_b16 创建 b16 粒度的 mask（f16 操作专用）。
           // 开发者需为不同数据类型选择不同 mask 种类（b16/b32/b8），选错即 bug。
           // VMI 对应: vmi.create_mask（统一 vmi.mask<Nxpred>，编译器管理粒度）。
 
+          // Activate the first 32 f16 lanes for the low/high D/2 half tiles.
           %mask16_half = pto.pge_b16 "PAT_VL32" : !pto.mask<b16>
           scf.for %s = %c0 to %s_count step %c1 {
             %x_s_off = arith.muli %s, %x_s_step : index
@@ -98,9 +120,13 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
             // lo(0:31) 和 hi(32:63) 分别存放。
             // VMI 对应: vmi.load（逻辑向量 vreg<128xf16>，编译器管理物理布局）。
 
+            // Load low-half cosine table.
             %cos_lo = pto.vlds %cos_ub[%cs_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+            // Load high-half cosine table from +D/2.
             %cos_hi = pto.vlds %cos_ub[%cs_hi_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+            // Load low-half sine table.
             %sin_lo = pto.vlds %sin_ub[%cs_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+            // Load high-half sine table from +D/2.
             %sin_hi = pto.vlds %sin_ub[%cs_hi_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
 
             // HALF layout: low 32 and high 32 elements are rotated as two partner halves.
@@ -112,7 +138,9 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
               %x_hi_off = arith.addi %x_off, %c32 : index
               %y_hi_off = arith.addi %y_off, %c32 : index
 
+              // Load low-half x for this head row.
               %x_lo = pto.vlds %x_ub[%x_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+              // Load high-half x, paired with x_lo in HALF-mode RoPE.
               %x_hi = pto.vlds %x_ub[%x_hi_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
 
               // ========================================================================
@@ -125,18 +153,26 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
               // VMI 对应: vmi.mulf/subf/addf（无 mask 参数，编译器自动生成）。
               // ========================================================================
 
+              // t0 = cos_lo * x_lo.
               %t0 = pto.vmul %cos_lo, %x_lo, %mask16_half : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+              // t1 = sin_lo * x_hi.
               %t1 = pto.vmul %sin_lo, %x_hi, %mask16_half : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+              // y_lo = cos_lo*x_lo - sin_lo*x_hi.
               %y_lo = pto.vsub %t0, %t1, %mask16_half : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
 
+              // t2 = cos_hi * x_hi.
               %t2 = pto.vmul %cos_hi, %x_hi, %mask16_half : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+              // t3 = sin_hi * x_lo.
               %t3 = pto.vmul %sin_hi, %x_lo, %mask16_half : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+              // y_hi = cos_hi*x_hi + sin_hi*x_lo.
               %y_hi = pto.vadd %t2, %t3, %mask16_half : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
 
               // MI: vsts 写回，绑定 mask<b16> 控制写入的活跃 lane。
               // VMI 对应: vmi.masked_store（统一 vmi.mask<Nxpred> 类型）。
 
+              // Store low-half output.
               pto.vsts %y_lo, %y_ub[%y_off], %mask16_half : !pto.vreg<128xf16>, !pto.ptr<f16, ub>, !pto.mask<b16>
+              // Store high-half output.
               pto.vsts %y_hi, %y_ub[%y_hi_off], %mask16_half : !pto.vreg<128xf16>, !pto.ptr<f16, ub>, !pto.mask<b16>
             }
           }
@@ -150,14 +186,18 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
           // 解交织/交织使用 vdintlv/vintlv 硬件指令——开发者需理解 lane 映射。
           // ========================================================================
 
+          // Pair mask covers 32 even/odd pairs after deinterleave.
           %mask16_pair = pto.pge_b16 "PAT_VL32" : !pto.mask<b16>
+          // Full mask covers the 64-lane dense interleaved store.
           %mask16_full = pto.pge_b16 "PAT_VL64" : !pto.mask<b16>
           scf.for %s = %c0 to %s_count step %c1 {
             %x_s_off = arith.muli %s, %x_s_step : index
             %cs_off = arith.muli %s, %cs_s_step : index
             %y_s_off = arith.muli %s, %y_s_step : index
 
+            // Load dense interleaved cosine table [c0,c1,c2,c3,...].
             %cos = pto.vlds %cos_ub[%cs_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+            // Load dense interleaved sine table [s0,s1,s2,s3,...].
             %sin = pto.vlds %sin_ub[%cs_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
             // building the rotated partner [-x1, x0, -x3, x2, ...] and then
             // evaluating y = x * cos + rotated(x) * sin.
@@ -168,7 +208,9 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
             // 输出两个 vreg<128xf16>（各只有半宽有效），需要知道 lane 映射关系。
             // VMI 对应: channel_split（语义化奇偶分解，直接产出 vreg<64>）。
 
+            // Split cosine into even and odd pair streams.
             %cos_even, %cos_odd = pto.vdintlv %cos, %cos : !pto.vreg<128xf16>, !pto.vreg<128xf16> -> !pto.vreg<128xf16>, !pto.vreg<128xf16>
+            // Split sine into even and odd pair streams.
             %sin_even, %sin_odd = pto.vdintlv %sin, %sin : !pto.vreg<128xf16>, !pto.vreg<128xf16> -> !pto.vreg<128xf16>, !pto.vreg<128xf16>
 
             scf.for %n = %c0 to %n_count step %c1 {
@@ -177,10 +219,12 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
               %x_off = arith.addi %x_s_off, %x_n_off : index
               %y_off = arith.addi %y_s_off, %y_n_off : index
 
+              // Load dense interleaved input x.
               %x = pto.vlds %x_ub[%x_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
               // MI: vdintlv 解交织 x，拆出 even/odd 两个半宽寄存器。
               // VMI 对应: channel_split。
 
+              // Split x into even and odd pair streams.
               %x_even, %x_odd = pto.vdintlv %x, %x : !pto.vreg<128xf16>, !pto.vreg<128xf16> -> !pto.vreg<128xf16>, !pto.vreg<128xf16>
 
               // Explicit even/odd RoPE equations for the interleaved layout.
@@ -190,12 +234,18 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
               // VMI 对应: 6条 vmi.mulf/subf/addf（无 mask 参数）。
               // ========================================================================
 
+              // x_even_cos = x_even * cos_even.
               %x_even_cos = pto.vmul %x_even, %cos_even, %mask16_pair : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+              // x_odd_sin = x_odd * sin_even.
               %x_odd_sin = pto.vmul %x_odd, %sin_even, %mask16_pair : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+              // y_even = x_even*cos_even - x_odd*sin_even.
               %y_even = pto.vsub %x_even_cos, %x_odd_sin, %mask16_pair : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
 
+              // x_odd_cos = x_odd * cos_odd.
               %x_odd_cos = pto.vmul %x_odd, %cos_odd, %mask16_pair : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+              // x_even_sin = x_even * sin_odd.
               %x_even_sin = pto.vmul %x_even, %sin_odd, %mask16_pair : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+              // y_odd = x_odd*cos_odd + x_even*sin_odd.
               %y_odd = pto.vadd %x_odd_cos, %x_even_sin, %mask16_pair : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
 
               // MI: vintlv 硬件交织——将独立的 even/odd 寄存器合并回
@@ -203,11 +253,13 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
               // 需要分别 store 或只 store 低半（取决于数据量）。
               // VMI 对应: channel_merge（产出单个 vreg<128>，逻辑更简洁）。
 
+              // Merge even/odd outputs back to dense interleaved order.
               %y_pack, %y_pack_hi = pto.vintlv %y_even, %y_odd : !pto.vreg<128xf16>, !pto.vreg<128xf16> -> !pto.vreg<128xf16>, !pto.vreg<128xf16>
               // MI: vsts 写回，绑定 mask<b16> full mask（64宽）。
               // vintlv 产出的 y_pack_hi 在当前数据量（64元素）下不需要 store。
               // VMI 对应: vmi.masked_store（单个 128xf16 向量一次写回）。
 
+              // Store dense interleaved output; y_pack_hi is unused for D=64.
               pto.vsts %y_pack, %y_ub[%y_off], %mask16_full : !pto.vreg<128xf16>, !pto.ptr<f16, ub>, !pto.mask<b16>
             }
           }

@@ -37,22 +37,57 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
       // ========================================================================
 
       pto.vecscope {
+        // Expected UB effect of this vecscope:
+        // - Inputs already in UB: xAddr contains f16 data rows; mxScale1ReciprocalAddr
+        //   contains bf16 reciprocal scale values produced by the OCP scale stage.
+        // - Output modified in UB: y1Addr is overwritten with packed FP8 E4M3 values.
+        // - Mathematical purpose per logical element i:
+        //     y1[i] = fp8_e4m3( f32(x[i]) * f32(reciprocal_scale[i]) )
+        //   using round-to-nearest-even and saturation in the f32->fp8 conversion.
+        // - The vector body processes each 256-element f16 row. DINTLV/EVEN/ODD/vintlv
+        //   only repair physical register layout so the final four PK4_B32 stores
+        //   produce dense 256-byte fp8 rows in y1Addr.
+        // xAddr and mxScale1ReciprocalAddr are read-only from the vector compute perspective.
+        // Instruction reading guide for this MI file:
+        // - pto.vldsx2 "DINTLV_B16" splits one 256-element f16 row into two
+        //   128-lane physical registers: even indices and odd indices.
+        // - pto.vcvt {part="EVEN"/"ODD"} is the second split caused by widening
+        //   f16 to f32. The four resulting 64xf32 streams each hold stride-4
+        //   logical indices until the vintlv repair steps run.
+        // - pto.vmul is the only numerical quant arithmetic: scaled = x * recip.
+        //   The surrounding vintlv instructions only restore logical order for
+        //   the fp8 packing path.
+        // - pto.vcvt {part="P0", rnd="R", sat="SAT"} narrows to fp8 E4M3 with
+        //   explicit rounding/saturation and byte-lane placement.
+        // - pto.vbitcast plus pto.vsts {dist="PK4_B32"} writes packed fp8 bytes.
+        // VMI expresses the same row as load -> extf -> mulf -> truncf ->
+        // masked_store on one logical vreg<256x...>.
         // MI: 需要三种 mask 粒度 - b16(load/vcvt), b32(vmul/vcvt/vsts)。
         // 每条 mask 指令创建的 mask 只能用于对应位宽的操作, 选错粒度 = 数据错误。
         // 对比 VMI: vmi.create_mask (统一 vmi.mask<256xpred>, 编译器管理粒度)。
 
+        // pset_b16 PAT_ALL creates an all-active predicate at 16-bit granularity.
+        // It is used by f16/bf16 conversion instructions whose source lanes are b16.
         %pregAllB16 = pto.pset_b16 "PAT_ALL" : !pto.mask<b16>
+        // pset_b32 PAT_ALL creates an all-active predicate at 32-bit granularity.
+        // It gates f32 multiply, f32->fp8 conversion, and PK4_B32 stores.
         %pregAllB32 = pto.pset_b32 "PAT_ALL" : !pto.mask<b32>
 
         // MI: vlds + E2B_B16 加载 reciprocal scale。E2B 分布模式将 128 个 bf16
         // 按每 2 元素一组广播到 256 宽的寄存器中。后续需 vbitcast ui16->bf16 再 vcvt。
 
+        // vlds E2B_B16 loads reciprocal scale halfwords from UB and broadcasts
+        // them in the hardware-defined element-to-block layout used by MX quant.
         %scaleForMulBits = pto.vlds %mxScale1ReciprocalAddr[%c0] {dist = "E2B_B16"}
           : !pto.ptr<ui16, ub> -> !pto.vreg<128xui16>
         // MI: vbitcast 类型重解释 ui16->bf16, 然后 vcvt + PART_EVEN 取有效 bf16 转 f32。
         // 因为 E2B_B16 排布, 有效数据在 EVEN 半区, 选 ODD 读到 0。
 
+        // vbitcast reinterprets the loaded uint16 bit pattern as bf16 values;
+        // no lane movement or numeric conversion happens here.
         %scaleForMulBF16 = pto.vbitcast %scaleForMulBits : !pto.vreg<128xui16> -> !pto.vreg<128xbf16>
+        // vcvt PART_EVEN widens the valid bf16 lanes from the E2B_B16 layout to
+        // f32 reciprocal-scale values used by the later vmul instructions.
         %scaleForMulFP32 = pto.vcvt %scaleForMulBF16, %pregAllB16 {part = "EVEN"}
           : !pto.vreg<128xbf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
 
@@ -83,41 +118,60 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
           //     为什么又要拆? f16(16bit)->f32(32bit) 位宽翻倍, 128个f32需要两个物理寄存器。
           //     同理 x1F16(奇数索引,128xf16) 也拆 EVEN/ODD -> 共 4 路 f32。
 
+          // x0F16 owns even logical indices. PART_EVEN takes physical lanes
+          // 0,2,4,..., yielding logical indices [0,4,8,...,252].
           %x0Zero0 = pto.vcvt %x0F16, %pregAllB16 {part = "EVEN"}
             : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+          // PART_ODD takes physical lanes 1,3,5,... from x0F16, yielding
+          // logical indices [2,6,10,...,254].
           %x0One0 = pto.vcvt %x0F16, %pregAllB16 {part = "ODD"}
             : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
           // (3) MI: 4 条 vmul 分别乘 reciprocal scale - 每条必须绑定 mask<b32>。
           //     因为第(2)步已拆成 4 路 f32, 乘法也只能 4 路独立进行。
           //     对比 VMI: 1 条 vmi.mulf (无 mask 参数)。
 
+          // Scale the x0/PART_EVEN stream: res[0,4,8,...] = x * reciprocal.
           %x0Zero1 = pto.vmul %x0Zero0, %scaleForMulFP32, %pregAllB32
             : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+          // Scale the x0/PART_ODD stream: res[2,6,10,...] = x * reciprocal.
           %x0One1 = pto.vmul %x0One0, %scaleForMulFP32, %pregAllB32
             : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
           // (4) MI: vintlv 交织合并 - 将 x0Zero1 和 x0One1 交替穿插。
           //     目的是把同一路 x0 的 EVEN/ODD 子块合并回去, 为后续 P0~P3 打包做准备。
           //     同理 x1 路也做 vintlv。
 
+          // vintlv repairs the EVEN/ODD split inside the x0 half. After this,
+          // x0Zero2 starts the even logical stream [0,2,4,...] and x0One2 holds
+          // the upper companion chunk [128,130,...].
           %x0Zero2, %x0One2 = pto.vintlv %x0Zero1, %x0One1
             : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
 
+          // x1F16 owns odd logical indices. PART_EVEN yields [1,5,9,...,253].
           %x1Zero0 = pto.vcvt %x1F16, %pregAllB16 {part = "EVEN"}
             : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+          // PART_ODD on x1F16 yields [3,7,11,...,255].
           %x1One0 = pto.vcvt %x1F16, %pregAllB16 {part = "ODD"}
             : !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<64xf32>
+          // Scale the x1/PART_EVEN stream: res[1,5,9,...] = x * reciprocal.
           %x1Zero1 = pto.vmul %x1Zero0, %scaleForMulFP32, %pregAllB32
             : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+          // Scale the x1/PART_ODD stream: res[3,7,11,...] = x * reciprocal.
           %x1One1 = pto.vmul %x1One0, %scaleForMulFP32, %pregAllB32
             : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+          // vintlv repairs the EVEN/ODD split inside the x1 half, producing
+          // odd-index contiguous chunks [1,3,5,...] and [129,131,...].
           %x1Zero2, %x1One2 = pto.vintlv %x1Zero1, %x1One1
             : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
 
           // (5) MI: 跨路 vintlv - 将 x0 路和 x1 路的 zero 子块交替穿插, ones 同理。
           //     结果为 4 路 f32, 顺序满足 P0/P1/P2/P3 打包要求。
 
+          // Cross-interleave the repaired x0/x1 low chunks. This restores logical
+          // order for the first 128 scaled values, split across the two outputs.
           %x0Zero, %x1Zero = pto.vintlv %x0Zero2, %x1Zero2
             : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
+          // Cross-interleave the repaired upper chunks. This restores logical
+          // order for the second 128 scaled values.
           %x0One, %x1One = pto.vintlv %x0One2, %x1One2
             : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
 
@@ -129,32 +183,51 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
           //     256 个 fp8 需 8 个寄存器, 按 part 分组打包。rnd/sat 用错会产生数值误差。
           //     对比 VMI: 1 条 vmi.truncf (编译器自动填入 rnd/sat 并管理 part)。
 
+          // Convert the first packed-output chunk to fp8 E4M3. rnd="R" is
+          // round-to-nearest-even, sat="SAT" clamps overflows, and part="P0"
+          // places each 8-bit result in byte slot P0 of its 32-bit lane.
           %x0ZeroFP8 = pto.vcvt %x0Zero, %pregAllB32 {rnd = "R", sat = "SAT", part = "P0"}
             : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256xf8E4M3FN>
+          // Reinterpret fp8 lanes as ui8 for the byte-oriented packed store.
           %x0ZeroU8 = pto.vbitcast %x0ZeroFP8 : !pto.vreg<256xf8E4M3FN> -> !pto.vreg<256xui8>
           // (7) MI: vsts + PK4_B32 打包写回 - 每条 store 前需 vbitcast fp8->ui8。
           //     PK4_B32 指示硬件将 4 个 8-bit 元素打包为一个 32-bit 单元写出。
           //     4 条 vsts 分别写回 P0/P1/P2/P3 四个 64 字节块, 地址依次偏移 64/128/192。
           //     对比 VMI: 1 条 vmi.masked_store (编译器自动处理 bitcast+pack+地址计算)。
 
+          // Store chunk 0 at byte offset +0. PK4_B32 extracts the P0 byte from
+          // each 32-bit lane and packs four fp8 values per 32-bit memory word.
           pto.vsts %x0ZeroU8, %y1Addr[%blockBase], %pregAllB32 {dist = "PK4_B32"}
             : !pto.vreg<256xui8>, !pto.ptr<ui8, ub>, !pto.mask<b32>
 
+          // Convert the second packed-output chunk. Note the source is %x1Zero,
+          // the companion result of the cross-interleave above; this ordering
+          // matches the CCE FP16 branch's four PK4_B32 stores.
           %x0OneFP8 = pto.vcvt %x1Zero, %pregAllB32 {rnd = "R", sat = "SAT", part = "P0"}
             : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256xf8E4M3FN>
+          // Reinterpret the second fp8 chunk as ui8 for packed byte storage.
           %x0OneU8 = pto.vbitcast %x0OneFP8 : !pto.vreg<256xf8E4M3FN> -> !pto.vreg<256xui8>
+          // Store chunk 1 at byte offset +64.
           pto.vsts %x0OneU8, %y1Addr[%yOff1], %pregAllB32 {dist = "PK4_B32"}
             : !pto.vreg<256xui8>, !pto.ptr<ui8, ub>, !pto.mask<b32>
 
+          // Convert the third packed-output chunk from %x0One, covering the next
+          // 64 logical fp8 results after the low 128-value group.
           %x1ZeroFP8 = pto.vcvt %x0One, %pregAllB32 {rnd = "R", sat = "SAT", part = "P0"}
             : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256xf8E4M3FN>
+          // Reinterpret the third fp8 chunk as ui8 for packed byte storage.
           %x1ZeroU8 = pto.vbitcast %x1ZeroFP8 : !pto.vreg<256xf8E4M3FN> -> !pto.vreg<256xui8>
+          // Store chunk 2 at byte offset +128.
           pto.vsts %x1ZeroU8, %y1Addr[%yOff2], %pregAllB32 {dist = "PK4_B32"}
             : !pto.vreg<256xui8>, !pto.ptr<ui8, ub>, !pto.mask<b32>
 
+          // Convert the fourth packed-output chunk from %x1One, completing the
+          // 256-element row.
           %x1OneFP8 = pto.vcvt %x1One, %pregAllB32 {rnd = "R", sat = "SAT", part = "P0"}
             : !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<256xf8E4M3FN>
+          // Reinterpret the fourth fp8 chunk as ui8 for packed byte storage.
           %x1OneU8 = pto.vbitcast %x1OneFP8 : !pto.vreg<256xf8E4M3FN> -> !pto.vreg<256xui8>
+          // Store chunk 3 at byte offset +192.
           pto.vsts %x1OneU8, %y1Addr[%yOff3], %pregAllB32 {dist = "PK4_B32"}
             : !pto.vreg<256xui8>, !pto.ptr<ui8, ub>, !pto.mask<b32>
         }

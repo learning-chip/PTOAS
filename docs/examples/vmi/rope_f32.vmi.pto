@@ -85,6 +85,17 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
     %is_half_mode = arith.cmpi eq, %mode, %c0_i32 : i32
 
     pto.vecscope {
+      // Expected UB effect of this vecscope:
+      // - Inputs already in UB: x_ub contains f32 rows x[s,n,0..63];
+      //   cos_ub/sin_ub contain f32 RoPE tables for each s.
+      // - Output modified in UB: y_ub is overwritten with f32 RoPE results.
+      // - mode == 0 (HALF/NeoX): for d in [0,32),
+      //     y[s,n,d]    = x[s,n,d]    * cos[s,d]    - x[s,n,d+32] * sin[s,d]
+      //     y[s,n,d+32] = x[s,n,d+32] * cos[s,d+32] + x[s,n,d]    * sin[s,d+32]
+      // - mode != 0 (INTERLEAVE/GPT-J): channel_split separates adjacent pairs and
+      //   computes y_even/y_odd with the Cartesian RoPE equations, then
+      //   channel_merge writes dense interleaved f32 output.
+      // x_ub/cos_ub/sin_ub are read-only from the vector compute perspective.
       // ========================================================================
       // VMI vs MI — RoPE f32 向量计算路径对比概览
       // ========================================================================
@@ -108,6 +119,15 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
       // 2. channel_split/merge 替代 vdintlv/vintlv，将"硬件 lane 重排"
       //    提升为"奇偶通道分解"的语义表达
       // ========================================================================
+      // Instruction reading guide for this VMI file:
+      // - pto.vmi.load/pto.vmi.masked_store name logical f32 vectors. Since f32
+      //   already maps cleanly to 64 physical lanes, VMI is mostly improving
+      //   consistency rather than hiding UNPK/PK machinery.
+      // - pto.vmi.mulf/subf/addf are ordinary element-wise f32 operations, but
+      //   unlike MI vmul/vsub/vadd they do not carry a mask operand on every line.
+      // - pto.vmi.channel_split/channel_merge describe the RoPE pair layout in
+      //   algorithm terms. Lowered MI still uses vdintlv/vintlv to realize that
+      //   parity split/merge on registers.
       //
       // ========================================================================
       // Half 模式 — 纯 f32 向量计算
@@ -128,6 +148,7 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
             // VMI: create_mask 逻辑长度 → vmi.mask<64xpred>。
             // MI 对应: pge_b32 "PAT_VL32" → !pto.mask<b32>。
             //   VMI 统一了 mask 类型，不再区分 b16/b32/b8。
+            // Create a logical tail predicate for the current half-D tile.
             %mask = pto.vmi.create_mask %active : index -> !pto.vmi.mask<64xpred>
 
             %cos1_off = arith.addi %cs_off, %elem_off : index
@@ -141,12 +162,16 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
             // MI 对应: pto.vlds %cos_ub[%cs_off] → !pto.vreg<64xf32>
             //   因为 f32 不存在 f16/bf16 的 UNPK/PK 问题，MI 的 load 也相对简洁。
             //   但 VMI 用统一的 vmi.load 接口覆盖所有数据类型，接口一致性更好。
+            // Load low-half cosine as a logical f32 vector.
             %cos1 = pto.vmi.load %cos_ub[%cos1_off]
                 : !pto.ptr<f32, ub> -> !pto.vmi.vreg<64xf32>
+            // Load high-half cosine from the aligned half-D base.
             %cos2 = pto.vmi.load %cos_ub[%cos2_off]
                 : !pto.ptr<f32, ub> -> !pto.vmi.vreg<64xf32>
+            // Load low-half sine.
             %sin1 = pto.vmi.load %sin_ub[%sin1_off]
                 : !pto.ptr<f32, ub> -> !pto.vmi.vreg<64xf32>
+            // Load high-half sine.
             %sin2 = pto.vmi.load %sin_ub[%sin2_off]
                 : !pto.ptr<f32, ub> -> !pto.vmi.vreg<64xf32>
 
@@ -163,8 +188,10 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
               %y2_base = arith.addi %y_off, %half_d_aligned : index
               %y2_off = arith.addi %y2_base, %elem_off : index
 
+              // Load low-half x for this head row.
               %x1 = pto.vmi.load %x_ub[%x1_off]
                   : !pto.ptr<f32, ub> -> !pto.vmi.vreg<64xf32>
+              // Load high-half x, paired with x1.
               %x2 = pto.vmi.load %x_ub[%x2_off]
                   : !pto.ptr<f32, ub> -> !pto.vmi.vreg<64xf32>
 
@@ -181,26 +208,34 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
               //   VMI 编译器根据向量宽度自动生成正确的 mask。
               // ========================================================================
               // y1 = x1 * cos - x2 * sin
+              // x1_cos = x1 * cos_low.
               %x1_cos = pto.vmi.mulf %x1, %cos1
                   : !pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32> -> !pto.vmi.vreg<64xf32>
+              // x2_sin = x2 * sin_low.
               %x2_sin = pto.vmi.mulf %x2, %sin1
                   : !pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32> -> !pto.vmi.vreg<64xf32>
+              // out1 = x1*cos_low - x2*sin_low.
               %out1 = pto.vmi.subf %x1_cos, %x2_sin
                   : !pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32> -> !pto.vmi.vreg<64xf32>
 
               // y2 = x2 * cos + x1 * sin
+              // x2_cos = x2 * cos_high.
               %x2_cos = pto.vmi.mulf %x2, %cos2
                   : !pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32> -> !pto.vmi.vreg<64xf32>
+              // x1_sin = x1 * sin_high.
               %x1_sin = pto.vmi.mulf %x1, %sin2
                   : !pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32> -> !pto.vmi.vreg<64xf32>
+              // out2 = x2*cos_high + x1*sin_high.
               %out2 = pto.vmi.addf %x2_cos, %x1_sin
                   : !pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32> -> !pto.vmi.vreg<64xf32>
 
               // VMI: masked_store 统一掩码写回。
               // MI 对应: pto.vsts %y_lo, %y_ub[%y_off], %mask32_half
               //   → !pto.vreg<64xf32> + !pto.mask<b32>。
+              // Store low-half output using the logical tail mask.
               pto.vmi.masked_store %out1, %y_ub[%y1_off], %mask
                   : !pto.vmi.vreg<64xf32>, !pto.ptr<f32, ub>, !pto.vmi.mask<64xpred>
+              // Store high-half output using the same logical tail mask.
               pto.vmi.masked_store %out2, %y_ub[%y2_off], %mask
                   : !pto.vmi.vreg<64xf32>, !pto.ptr<f32, ub>, !pto.vmi.mask<64xpred>
             }
@@ -234,9 +269,12 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
           // ========================================================================
           //   y_even = x_even * cos_even - x_odd * sin_even
           //   y_odd  = x_odd  * cos_odd  + x_even * sin_odd
+          // Create a logical predicate for the full D=64 interleaved row.
           %mask = pto.vmi.create_mask %c64 : index -> !pto.vmi.mask<128xpred>
+          // Load dense interleaved cosine table.
           %cos = pto.vmi.load %cos_ub[%cs_off]
               : !pto.ptr<f32, ub> -> !pto.vmi.vreg<128xf32>
+          // Load dense interleaved sine table.
           %sin = pto.vmi.load %sin_ub[%cs_off]
               : !pto.ptr<f32, ub> -> !pto.vmi.vreg<128xf32>
 
@@ -245,8 +283,10 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
           // 使得后续 RoPE 成对计算可以用分离的向量直接表达。
           // MI 对应: pto.vdintlv %cos, %cos → !pto.vreg<64xf32>, !pto.vreg<64xf32>
           //   硬件解交织指令，需要理解寄存器 lane 映射关系。
+          // Split cosine into even and odd pair channels.
           %cos_even, %cos_odd = "pto.vmi.channel_split"(%cos)
               : (!pto.vmi.vreg<128xf32>) -> (!pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32>)
+          // Split sine into even and odd pair channels.
           %sin_even, %sin_odd = "pto.vmi.channel_split"(%sin)
               : (!pto.vmi.vreg<128xf32>) -> (!pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32>)
 
@@ -257,11 +297,13 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
             %x_off = arith.addi %x_s_off, %x_n_off : index
             %y_off = arith.addi %y_s_off, %y_n_off : index
 
+            // Load dense interleaved x row.
             %x = pto.vmi.load %x_ub[%x_off]
                 : !pto.ptr<f32, ub> -> !pto.vmi.vreg<128xf32>
 
             // MI 对应: pto.vdintlv %x, %x → x_even(64xf32), x_odd(64xf32)
             //   硬件解交织——VMI 用 channel_split 语义化表达同样的意图。
+            // Split x into even and odd pair channels.
             %x_even, %x_odd = "pto.vmi.channel_split"(%x)
                 : (!pto.vmi.vreg<128xf32>) -> (!pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32>)
 
@@ -273,17 +315,23 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
             // VMI: mulf/subf/addf 无 mask——4条乘+2条加减表达完整的成对 RoPE。
             // MI 对应: 8条 vmul/vadd/vsub，每条都带 mask<b32>。
             // ========================================================================
+            // x_even_cos = x_even * cos_even.
             %x_even_cos = pto.vmi.mulf %x_even, %cos_even
                 : !pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32> -> !pto.vmi.vreg<64xf32>
+            // x_odd_sin = x_odd * sin_even.
             %x_odd_sin = pto.vmi.mulf %x_odd, %sin_even
                 : !pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32> -> !pto.vmi.vreg<64xf32>
+            // y_even = x_even*cos_even - x_odd*sin_even.
             %y_even = pto.vmi.subf %x_even_cos, %x_odd_sin
                 : !pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32> -> !pto.vmi.vreg<64xf32>
 
+            // x_odd_cos = x_odd * cos_odd.
             %x_odd_cos = pto.vmi.mulf %x_odd, %cos_odd
                 : !pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32> -> !pto.vmi.vreg<64xf32>
+            // x_even_sin = x_even * sin_odd.
             %x_even_sin = pto.vmi.mulf %x_even, %sin_odd
                 : !pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32> -> !pto.vmi.vreg<64xf32>
+            // y_odd = x_odd*cos_odd + x_even*sin_odd.
             %y_odd = pto.vmi.addf %x_odd_cos, %x_even_sin
                 : !pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32> -> !pto.vmi.vreg<64xf32>
 
@@ -291,6 +339,7 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
             // MI 对应: pto.vintlv %y_even, %y_odd → y_pack(64xf32), y_pack_hi(64xf32)
             //   硬件交织指令，产生两个输出（低半/高半），而 channel_merge 直接
             //   产出一个 vreg<128xf32>，更符合"逻辑向量"的思维模型。
+            // Merge even/odd outputs back to dense interleaved order.
             %out = "pto.vmi.channel_merge"(%y_even, %y_odd)
                 : (!pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32>) -> !pto.vmi.vreg<128xf32>
 
@@ -298,6 +347,7 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
             // MI 对应: pto.vsts %y_pack, %y_ub[%y_off], %mask32_full
             //   → 需要 !pto.mask<b32>，且 vintlv 产出的 y_pack_hi 在 MI 中
             //   需要额外的 store 指令——VMI 的单个 128xf32 向量更简洁。
+            // Store the dense interleaved output.
             pto.vmi.masked_store %out, %y_ub[%y_off], %mask
                 : !pto.vmi.vreg<128xf32>, !pto.ptr<f32, ub>, !pto.vmi.mask<128xpred>
           }

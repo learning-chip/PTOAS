@@ -87,6 +87,21 @@ convert, and multi-store PK packing choreography.
 **VMI does not remove:** row/block loop nesting, UB stride math, gather-index
 setup at the API boundary, DMA, or pipeline flags.
 
+The VMI conversion ops intentionally mirror MLIR `arith` names, but operate on
+abstract vector registers:
+
+- `pto.vmi.extf` / `extsi` / `extui` mean per-lane extension while preserving
+  logical index `i`.
+- `pto.vmi.truncf` / `trunci` mean per-lane narrowing to the destination element
+  type while preserving logical index `i`.
+
+This is a semantic contract, not a one-instruction promise. In the f16→fp8
+quant path, one `vmi.extf` over `vreg<256×f16>` lowers to split loads, four
+`vcvt {part=EVEN/ODD}` conversions, and layout repair. One `vmi.truncf` plus
+`masked_store` lowers to fp8 `vcvt` with rounding/saturation/part placement and
+packed stores. VMI removes layout authorship; the lowered MI still performs the
+necessary hardware work.
+
 ---
 
 ## 3. Instruction map: math → CCE → MI → VMI
@@ -109,6 +124,25 @@ setup at the API boundary, DMA, or pipeline flags.
 | Re-order after widen | `vintlv` | 4× `pto.vintlv` to rebuild P0–P3 layout | *(compiler)* |
 | Narrow f32 → fp8 E4M3 | `vcvt` (`ROUND_R`, `RS_ENABLE`, `PART_P0`, `MODE_ZEROING`) | 4× `pto.vcvt` + `vbitcast` + 4× `pto.vsts` `{dist=PK4_B32}` | `pto.vmi.truncf` + `pto.vmi.masked_store` |
 | Tail / active lanes | `pset` / `plt_b16` / `plt_b32` / `plt_b8` | `pto.pset_b16` / `pset_b32` / `pset_b8` / `pge_*` | `pto.vmi.create_mask` |
+
+Instruction behavior and caveats:
+
+- `vmi.load` names a logical row. For `vreg<256×f16>`, the lowered MI cannot fit
+  the row into one 256-byte physical register, so it uses `DINTLV_B16` or an
+  equivalent split layout.
+- `vmi.broadcast` creates a logical vector constant. MI `vbr` broadcasts into one
+  physical register width, which is why MI scale code often carries separate
+  constants for each DINTLV half.
+- `vmi.cmpi` + `vmi.select` are written as ordinary predicate/select data flow.
+  MI uses `vcmp`/`vsel` with a concrete b16 mask, and CCE exposes the same
+  predicate register handling.
+- `group_reduce_maxi` and `group_broadcast` deliberately split the two meanings
+  hidden inside `vcgmax`: reduction across lanes and replication of the result.
+- `trunci` replaces `vpack LOWER` only at the VMI surface. Lowering still has to
+  honor the source lane layout and destination byte layout.
+- `masked_store` hides whether the MI store is `NORM_B8`, `NORM_B16`, or
+  `PK4_B32`; those are layout decisions derived from the value type and assigned
+  physical layout.
 
 ### 3.1 MI details algorithm engineers should not have to memorize
 
@@ -376,6 +410,19 @@ VMI advantage: the algorithm reads as “mask exponent bits, running max over 25
 lanes”. MI/CCE force you to track **even/odd half ownership** from the first
 load.
 
+Instruction-by-instruction:
+
+- `vmi.load` reads the row as `vreg<256×ui16>` so the exponent extraction can be
+  written once over logical lanes. MI starts with `vldsx2 DINTLV_B16`, producing
+  even and odd ownership domains.
+- `vmi.bitcast` changes interpretation from unsigned bits to signed integer
+  lanes without moving data, matching MI `vbitcast`.
+- `vmi.andi` masks with `0x7F80`, keeping bf16 exponent bits `[14:7]`. MI/CCE
+  spell this as `vand` plus an all-lanes b16 predicate.
+- `vmi.cmpi "slt"` produces the predicate `acc < xExp`, and `vmi.select` chooses
+  the new maximum. MI/CCE use `vmax`, which is shorter but less explicit about
+  the comparison/select relation.
+
 **Physical layout note:** the scale path never widens to f32 per element, so it
 does **not** need the four-quadrant `vintlv` chain from §3.5. It still pays the
 **DINTLV load tax**: `acc0` owns exponent maxima for logical indices
@@ -452,6 +499,17 @@ This is the clearest VMI win in the MX quant suite.
 %res_fp8 = pto.vmi.truncf %res_fp32 : ... -> !pto.vmi.vreg<256xf8E4M3FN>
 pto.vmi.masked_store %res_fp8, %y_ub[%row_off], %full_mask : ...
 ```
+
+Each line corresponds directly to the row formula `y_i = fp8(x_i * scale_i)`:
+
+- `vmi.load` establishes the logical index contract `[0..255]`.
+- `extf` widens each f16 lane to f32; in MI this is four `vcvt` ops because
+  `DINTLV_B16` and width expansion create four physical streams.
+- `mulf` is the only numerical arithmetic in this stage.
+- `truncf` narrows to FP8 E4M3 with target rounding/saturation rules. MI must
+  spell `rnd=R`, `sat=SAT`, and part placement explicitly.
+- `masked_store` writes the packed fp8 row. MI needs four `PK4_B32` stores at
+  byte offsets `0, 64, 128, 192`.
 
 ### 6.3 MI quant path (same math, hardware vocabulary)
 

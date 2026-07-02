@@ -92,6 +92,15 @@ type-conversion protocol details.
 math, DMA setup, or pipeline synchronization. Those remain visible in the
 examples.
 
+The VMI cast names intentionally follow MLIR `arith` vocabulary. `pto.vmi.extf`
+means “extend each logical lane to a wider floating type”, and
+`pto.vmi.truncf` means “narrow each logical lane to the destination floating
+type”. They are not claims about the number of hardware instructions. On bf16
+RoPE, one `extf` may lower through `vlds UNPK_B16` and `vcvt PART_EVEN`; one
+`truncf` plus `masked_store` may lower through `vcvt PART_EVEN` and `vsts
+PK_B32`. The abstraction is about preserving the algorithmic lane contract, not
+making the hardware layout disappear.
+
 ---
 
 ## 3. Instruction map: math → MI → VMI
@@ -109,6 +118,21 @@ The table below connects the math step to what you write at each layer.
 | Negate odd lane stream | `vbr` + `vmul` (`MODE_ZEROING`) | same | `pto.vmi.negf` |
 | Merge even/odd back | `vintlv` | `pto.vintlv` | `pto.vmi.channel_merge` |
 | Store with tail mask | `vsts` (`NORM_B16` / `NORM_B32` / `PK_B32` + mask) | `pto.vsts` (+ optional `{dist = "PK_B32"}`) + mask | `pto.vmi.masked_store` |
+
+How to read the instruction map:
+
+- `vmi.load` is a logical UB load. In f32 and dense f16 cases it lowers close to
+  `vlds NORM`. In bf16/f16 widen paths it may need `UNPK_B16` so that the next
+  MI `vcvt PART_EVEN` sees valid halfword lanes.
+- `vmi.mulf`, `vmi.addf`, and `vmi.subf` are element-wise arithmetic on logical
+  vectors. MI still needs `mask<b16>` or `mask<b32>` on every arithmetic op;
+  VMI carries the active-lane predicate at load/store or higher-level mask
+  creation points.
+- `channel_split` and `channel_merge` describe parity layout intent. They are
+  the VMI names for the same even/odd axis that MI exposes with `vdintlv` and
+  `vintlv`.
+- `masked_store` says “write active logical lanes”. MI still decides whether the
+  store is a plain `NORM_*` store or a packing store such as `PK_B32`.
 
 ### 3.1 MI details algorithm engineers should not have to memorize
 
@@ -407,6 +431,23 @@ pto.vmi.masked_store %out1, %y_ub[%y1_off], %mask : ...
 This reads as the math plus dtype semantics: **load → widen → compute →
 truncate → store**. The compiler chooses UNPK/PART_EVEN/PK_B32 and mask
 families.
+
+Instruction-by-instruction, that means:
+
+- `%cos1_16 = pto.vmi.load ... -> vreg<64xf16>` reads the table as 64 logical
+  f16 lanes. The MI equivalent has to remember that a b16 physical register is
+  128 lanes and that `UNPK_B16` places useful values on even lanes.
+- `%cos1 = pto.vmi.extf %cos1_16` is the same semantic operation as
+  `arith.extf` lifted to a VMI vector register. The MI equivalent is `vcvt
+  PART_EVEN` because of the previous unpacked physical layout.
+- `%x1_cos = pto.vmi.mulf %x1, %cos1` is exactly the first term in
+  `x1*cos`. The MI equivalent is `vmul` plus `mask<b32>`.
+- `%out1_f32 = pto.vmi.subf %x1_cos, %x2_sin` is the low-half RoPE subtraction.
+  No hidden numerical trick is implied; it is the same fp32 subtract as MI/CCE.
+- `%out1 = pto.vmi.truncf %out1_f32` narrows each logical lane back to bf16.
+  MI must spell the rounding/saturation and destination part explicitly.
+- `pto.vmi.masked_store` writes the active logical lanes. MI/CCE use `vsts
+  PK_B32` here because the narrowed bf16 values live in even physical lanes.
 
 **CCE** (`ComputeBf16` HALF) documents the same protocol explicitly in comments
 — excellent for verification, heavy for authoring.
