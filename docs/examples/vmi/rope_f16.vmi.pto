@@ -88,6 +88,17 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
     %is_half_mode = arith.cmpi eq, %mode, %c0_i32 : i32
 
     pto.vecscope {
+      // Expected UB effect of this vecscope:
+      // - Inputs already in UB: x_ub contains f16 rows x[s,n,0..63];
+      //   cos_ub/sin_ub contain f16 RoPE tables for each s.
+      // - Output modified in UB: y_ub is overwritten with the RoPE-rotated f16 row.
+      // - mode == 0 (HALF/NeoX): for d in [0,32),
+      //     y[s,n,d]    = x[s,n,d]    * cos[s,d]    - x[s,n,d+32] * sin[s,d]
+      //     y[s,n,d+32] = x[s,n,d+32] * cos[s,d+32] + x[s,n,d]    * sin[s,d+32]
+      // - mode != 0 (INTERLEAVE/GPT-J): constructs rot(x)=[-x1,x0,-x3,x2,...]
+      //   in logical vector form and computes y = x*cos + rot(x)*sin. This VMI
+      //   spelling widens to f32 for the interleave body, then narrows to f16.
+      // x_ub/cos_ub/sin_ub are read-only from the vector compute perspective.
       // ========================================================================
       // VMI vs MI — RoPE f16 向量计算路径对比概览
       // ========================================================================
@@ -136,6 +147,7 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
             // VMI: create_mask 用逻辑长度直接创建，统一 vmi.mask<Nxpred>。
             // MI 对应: pge_b16 "PAT_VL32" → !pto.mask<b16>，
             //   不同数据类型需要不同粒度的 mask（b16/b32/b8），VMI 统一为一种。
+            // Create a logical tail predicate for this f16 half tile.
             %mask = pto.vmi.create_mask %active : index -> !pto.vmi.mask<128xpred>
 
             %cos1_off = arith.addi %cs_off, %elem_off : index
@@ -150,12 +162,16 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
             //   → !pto.vreg<128xf16>，需要开发者指定 UNPK_B16 解包模式，
             //   且明白有效数据只占 EVEN 位置，ODD 是填充 0。
             // VMI 消除了 dist 模式选择——编译器根据上下文自动决定物理排布。
+            // Load low-half cosine as a logical f16 vector.
             %cos1_16 = pto.vmi.load %cos_ub[%cos1_off]
                 : !pto.ptr<f16, ub> -> !pto.vmi.vreg<128xf16>
+            // Load high-half cosine from the aligned half-D base.
             %cos2_16 = pto.vmi.load %cos_ub[%cos2_off]
                 : !pto.ptr<f16, ub> -> !pto.vmi.vreg<128xf16>
+            // Load low-half sine.
             %sin1_16 = pto.vmi.load %sin_ub[%sin1_off]
                 : !pto.ptr<f16, ub> -> !pto.vmi.vreg<128xf16>
+            // Load high-half sine.
             %sin2_16 = pto.vmi.load %sin_ub[%sin2_off]
                 : !pto.ptr<f16, ub> -> !pto.vmi.vreg<128xf16>
 
@@ -172,8 +188,10 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
               %y2_base = arith.addi %y_off, %half_d_aligned : index
               %y2_off = arith.addi %y2_base, %elem_off : index
 
+              // Load low-half x for this head row.
               %x1_16 = pto.vmi.load %x_ub[%x1_off]
                   : !pto.ptr<f16, ub> -> !pto.vmi.vreg<128xf16>
+              // Load high-half x, paired with x1_16.
               %x2_16 = pto.vmi.load %x_ub[%x2_off]
                   : !pto.ptr<f16, ub> -> !pto.vmi.vreg<128xf16>
 
@@ -191,17 +209,23 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
               //   每条算术指令都需要显式携带 mask（b16 for f16），
               //   VMI 消除了这个负担——编译器自动管理 mask。
               // ========================================================================
+              // x1_cos = x1 * cos_low.
               %x1_cos = pto.vmi.mulf %x1_16, %cos1_16
                   : !pto.vmi.vreg<128xf16>, !pto.vmi.vreg<128xf16> -> !pto.vmi.vreg<128xf16>
+              // x2_sin = x2 * sin_low.
               %x2_sin = pto.vmi.mulf %x2_16, %sin1_16
                   : !pto.vmi.vreg<128xf16>, !pto.vmi.vreg<128xf16> -> !pto.vmi.vreg<128xf16>
+              // out1 = x1*cos_low - x2*sin_low.
               %out1 = pto.vmi.subf %x1_cos, %x2_sin
                   : !pto.vmi.vreg<128xf16>, !pto.vmi.vreg<128xf16> -> !pto.vmi.vreg<128xf16>
 
+              // x2_cos = x2 * cos_high.
               %x2_cos = pto.vmi.mulf %x2_16, %cos2_16
                   : !pto.vmi.vreg<128xf16>, !pto.vmi.vreg<128xf16> -> !pto.vmi.vreg<128xf16>
+              // x1_sin = x1 * sin_high.
               %x1_sin = pto.vmi.mulf %x1_16, %sin2_16
                   : !pto.vmi.vreg<128xf16>, !pto.vmi.vreg<128xf16> -> !pto.vmi.vreg<128xf16>
+              // out2 = x2*cos_high + x1*sin_high.
               %out2 = pto.vmi.addf %x2_cos, %x1_sin
                   : !pto.vmi.vreg<128xf16>, !pto.vmi.vreg<128xf16> -> !pto.vmi.vreg<128xf16>
 
@@ -211,8 +235,10 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
               //   且 f16 store 在 MI 中可能需要 {pk = "PK_B32"} 打包模式
               //   （当数据从 f32 narrowing 后分散在 EVEN 位置时），
               //   VMI 无需关心 pack 策略。
+              // Store low-half output under the logical tail mask.
               pto.vmi.masked_store %out1, %y_ub[%y1_off], %mask
                   : !pto.vmi.vreg<128xf16>, !pto.ptr<f16, ub>, !pto.vmi.mask<128xpred>
+              // Store high-half output under the same mask.
               pto.vmi.masked_store %out2, %y_ub[%y2_off], %mask
                   : !pto.vmi.vreg<128xf16>, !pto.ptr<f16, ub>, !pto.vmi.mask<128xpred>
             }
@@ -240,21 +266,29 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
             // VMI 版本选择 f16→f32 扩展精度后再截断——因为 VMI 不需要开发者关心
             //   vcvt 的 part/EVEN 细节，提升精度几乎无成本。
             // ========================================================================
+            // Create a logical predicate for the active interleaved lanes.
             %mask = pto.vmi.create_mask %active : index -> !pto.vmi.mask<128xpred>
 
             %cs_elem_off = arith.addi %cs_off, %elem_off : index
+            // Load dense interleaved f16 cosine table.
             %cos16 = pto.vmi.load %cos_ub[%cs_elem_off]
                 : !pto.ptr<f16, ub> -> !pto.vmi.vreg<128xf16>
+            // Load dense interleaved f16 sine table.
             %sin16 = pto.vmi.load %sin_ub[%cs_elem_off]
                 : !pto.ptr<f16, ub> -> !pto.vmi.vreg<128xf16>
 
             // VMI: extf 将 f16 语义扩展为 f32——无需指定 part。
+            // This deliberately mirrors MLIR arith.extf, but the value lives in an
+            // abstract vector register. It preserves logical element order while the
+            // lowering pass chooses any required MI vcvt part/layout sequence.
             // MI 对应: pto.vcvt %cos, %mask_b16 {part = "EVEN"}
             //   → 开发者必须知道 UNPK_B16 load 后有效数据在 EVEN 位置，
             //   选错 part（EVEN vs ODD）会导致读到填充的 0 或错位数据。
             // VMI 的 extf 屏蔽了这个陷阱：编译器自己知道数据在哪。
+            // Widen cosine table to f32 logical lanes.
             %cos = pto.vmi.extf %cos16
                 : !pto.vmi.vreg<128xf16> -> !pto.vmi.vreg<128xf32>
+            // Widen sine table to f32 logical lanes.
             %sin = pto.vmi.extf %sin16
                 : !pto.vmi.vreg<128xf16> -> !pto.vmi.vreg<128xf32>
 
@@ -267,9 +301,11 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
               %x_elem_off = arith.addi %x_off, %elem_off : index
               %y_elem_off = arith.addi %y_off, %elem_off : index
 
+              // Load dense interleaved f16 input x.
               %x16 = pto.vmi.load %x_ub[%x_elem_off]
                   : !pto.ptr<f16, ub> -> !pto.vmi.vreg<128xf16>
 
+              // Widen x to f32 before constructing rot(x).
               %x = pto.vmi.extf %x16
                   : !pto.vmi.vreg<128xf16> -> !pto.vmi.vreg<128xf32>
 
@@ -290,32 +326,43 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
               //    编排 negate + 重排更直观
               // 3. 所有 mulf/addf 无需 mask 参数——编译器自动管理
               // ========================================================================
+              // Split x into even and odd pair channels.
               %x_even, %x_odd = "pto.vmi.channel_split"(%x)
                   : (!pto.vmi.vreg<128xf32>) -> (!pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32>)
+              // Negate odd channel to form the first half of rot(x).
               %neg_x_odd = pto.vmi.negf %x_odd
                   : !pto.vmi.vreg<64xf32> -> !pto.vmi.vreg<64xf32>
+              // Merge [-odd, even] back into dense interleaved rot(x).
               %rot = "pto.vmi.channel_merge"(%neg_x_odd, %x_even)
                   : (!pto.vmi.vreg<64xf32>, !pto.vmi.vreg<64xf32>) -> !pto.vmi.vreg<128xf32>
 
               // VMI: mulf / addf 直接表达 f32 向量乘加，无需 mask 参数。
               // MI 对应: 每条 vmul/vadd 都需要显式 mask<b32>。
+              // x_cos = x * cos.
               %x_cos = pto.vmi.mulf %x, %cos
                   : !pto.vmi.vreg<128xf32>, !pto.vmi.vreg<128xf32> -> !pto.vmi.vreg<128xf32>
+              // rot_sin = rot(x) * sin.
               %rot_sin = pto.vmi.mulf %rot, %sin
                   : !pto.vmi.vreg<128xf32>, !pto.vmi.vreg<128xf32> -> !pto.vmi.vreg<128xf32>
+              // out_f32 = x*cos + rot(x)*sin.
               %out_f32 = pto.vmi.addf %x_cos, %rot_sin
                   : !pto.vmi.vreg<128xf32>, !pto.vmi.vreg<128xf32> -> !pto.vmi.vreg<128xf32>
               // VMI: truncf 将 f32 截断回 f16——无需 rnd/sat 参数。
+              // Like MLIR arith.truncf, this is a typed semantic narrowing on
+              // logical lanes; target lowering supplies the MI rounding/saturation
+              // and any pack/store protocol required by the chosen layout.
               // MI 对应: pto.vcvt %out_f32, %mask_b32 {part = "EVEN", rnd = "R", sat = "SAT"}
               //   → 开发者必须指定舍入模式 (rnd="R"=round nearest even)
               //   和饱和模式 (sat="SAT")，用错会产生数值误差。
               // VMI 编译器根据目标类型自动填入正确的舍入/饱和参数。
+              // Narrow f32 result back to f16 logical lanes.
               %out = pto.vmi.truncf %out_f32
                   : !pto.vmi.vreg<128xf32> -> !pto.vmi.vreg<128xf16>
 
               // VMI: masked_store 用统一的 vmi.mask<128xpred> 掩码写回。
               // MI 对应: pto.vsts %y_pack, %y_ub[%y_off], %mask16_full
               //   → 需要 !pto.mask<b16> + 可能需要 pk 模式。
+              // Store dense interleaved f16 output.
               pto.vmi.masked_store %out, %y_ub[%y_elem_off], %mask
                   : !pto.vmi.vreg<128xf16>, !pto.ptr<f16, ub>, !pto.vmi.mask<128xpred>
             }
