@@ -71,8 +71,8 @@ bytes. This matches the FP16 branch of `ComputeY1ToFP8` in CCE.
 ## 2. What VMI Changes
 
 VMI lets the author write logical vectors such as `!pto.vmi.vreg<256xf16>` and
-semantic ops such as `vmi.load`, `vmi.extf`, `vmi.mulf`, `group_reduce_maxi`,
-`vmi.truncf`, and `vmi.masked_store`.
+semantic ops such as `pto.vmi.vload`, `pto.vmi.vcvt`, `pto.vmi.vmul`,
+`pto.vmi.vcmax`, `pto.vmi.vbrc`, and `pto.vmi.vstore`.
 
 Lowering still emits MI instructions with concrete:
 
@@ -84,10 +84,9 @@ Lowering still emits MI instructions with concrete:
 
 The VMI conversion ops mirror MLIR `arith` naming:
 
-- `extf`, `extsi`, `extui`: widen or extend each logical lane
-- `truncf`, `trunci`: narrow each logical lane
+- `vcvt`: widen, narrow, or reinterpret lane element types at the semantic level
 
-These names describe lane-wise meaning. `vmi.extf` over `vreg<256xf16>` is not
+These names describe lane-wise meaning. `pto.vmi.vcvt` over `vreg<256xf16>` is not
 one hardware instruction; the MI lowering has to split a 512-byte row, widen
 four physical streams, and repair layout.
 
@@ -99,10 +98,10 @@ Tag instructions by role:
 
 | Role | Question | MX examples |
 |------|----------|-------------|
-| **MATH** | Does it change the numeric value? | max/select, scale encode, `mulf` |
-| **TYPE** | Does it change dtype while preserving lane `i`? | `extf`, `truncf`, `trunci`, `vcvt`, `vpack` |
+| **MATH** | Does it change the numeric value? | max/select, scale encode, `vmul` |
+| **TYPE** | Does it change dtype while preserving lane `i`? | `vcvt`, `vpack` |
 | **LAYOUT** | Does it only move lanes or bytes? | `DINTLV_B16`, `PART_EVEN/ODD`, `vintlv`, `PK4_B32`, `vselr` |
-| **MEMORY** | Does it cross the UB/register boundary? | `load`, `store`, `masked_store`, `vlds`, `vsts` |
+| **MEMORY** | Does it cross the UB/register boundary? | `vload`, `vstore`, `vlds`, `vsts` |
 
 VMI keeps **MATH** and **TYPE** in the source. MI/CCE expose **LAYOUT** and
 **MEMORY** because the author is programming physical registers.
@@ -111,25 +110,25 @@ VMI keeps **MATH** and **TYPE** in the source. MI/CCE expose **LAYOUT** and
 
 | Math intent | CCE / MI shape | VMI shape |
 |-------------|----------------|-----------|
-| Load 256 b16 values | `vldsx2 DINTLV_B16` | `pto.vmi.load` |
-| Extract bf16 exponent bits | `vand` + b16 mask | `pto.vmi.andi` |
-| Running max | `vmax` over two split accumulators | `cmpi` + `select` over one logical vector |
-| Group max | `vcgmax` | `group_reduce_maxi` + `group_broadcast` |
-| Scale byte narrowing | `vpack LOWER` | `pto.vmi.trunci` |
-| Load reciprocal scale | `vlds E2B_B16` + bitcast + `vcvt EVEN` | `vmi.load` + `vmi.extf` |
-| Widen f16 to fp32 | 4x `vcvt EVEN/ODD` | `pto.vmi.extf` |
+| Load 256 b16 values | `vldsx2 DINTLV_B16` | `pto.vmi.vload` |
+| Extract bf16 exponent bits | `vand` + b16 mask | `pto.vmi.vand` |
+| Running max | `vmax` over two split accumulators | `vcmp` + `vsel` over one logical vector |
+| Group max | `vcgmax` | `pto.vmi.vcmax` + `pto.vmi.vbrc` |
+| Scale byte narrowing | `vpack LOWER` | `pto.vmi.vcvt` |
+| Load reciprocal scale | `vlds E2B_B16` + bitcast + `vcvt EVEN` | `pto.vmi.vload` + `pto.vmi.vcvt` |
+| Widen f16 to fp32 | 4x `vcvt EVEN/ODD` | `pto.vmi.vcvt` |
 | Repair widened layout | 4x `vintlv` | compiler lowering |
-| fp32 multiply | 4x `vmul` + b32 mask | `pto.vmi.mulf` |
-| fp32 to fp8 | 4x `vcvt {P0,rnd=R,sat=SAT}` | `pto.vmi.truncf` |
-| Store fp8 row | 4x `vsts PK4_B32` | `pto.vmi.masked_store` |
+| fp32 multiply | 4x `vmul` + b32 mask | `pto.vmi.vmul` |
+| fp32 to fp8 | 4x `vcvt {P0,rnd=R,sat=SAT}` | `pto.vmi.vcvt` |
+| Store fp8 row | 4x `vsts PK4_B32` | `pto.vmi.vstore` |
 
 ### Expected Lowering Shapes
 
 **256-lane f16 load + widen:**
 
 ```mlir
-%x_f16 = pto.vmi.load %x_ub[%row_off] : ... -> !pto.vmi.vreg<256xf16>
-%x_f32 = pto.vmi.extf %x_f16 : ... -> !pto.vmi.vreg<256xf32>
+%x_f16 = pto.vmi.vload %x_ub[%row_off] : ... -> !pto.vmi.vreg<256xf16>
+%x_f32 = pto.vmi.vcvt %x_f16 : ... -> !pto.vmi.vreg<256xf32>
 ```
 
 Expected MI/CCE shape:
@@ -141,14 +140,14 @@ Expected MI/CCE shape:
 // same for x1, followed by vintlv repair before fp8 conversion
 ```
 
-`extf` means “produce f32 lane `i` for every logical `x[i]`.” MI has to expose
+`vcvt` means “produce f32 lane `i` for every logical `x[i]`.” MI has to expose
 the physical split and repair.
 
 **fp32 to fp8 narrow + store:**
 
 ```mlir
-%y_fp8 = pto.vmi.truncf %scaled : ... -> !pto.vmi.vreg<256xf8E4M3FN>
-pto.vmi.masked_store %y_fp8, %y_ub[%row_off], %mask : ...
+%y_fp8 = pto.vmi.vcvt %scaled : ... -> !pto.vmi.vreg<256xf8E4M3FN>
+pto.vmi.vstore %y_fp8, %y_ub[%row_off], %mask : ...
 ```
 
 Expected MI/CCE shape:
@@ -160,13 +159,13 @@ pto.vsts %chunk_u8, %y_ub[%off], %mask8 {dist = "PK4_B32"} : ...
 // repeated at byte offsets 0, 64, 128, 192
 ```
 
-`truncf` preserves logical lane order and FP8 semantics. `PART_P0` and
+`vcvt` preserves logical lane order and FP8 semantics. `PART_P0` and
 `PK4_B32` are the physical byte-placement protocol.
 
 **Scale-byte narrowing:**
 
 ```mlir
-%scale_u8 = pto.vmi.trunci %scale_u16 : ... -> !pto.vmi.vreg<256xui8>
+%scale_u8 = pto.vmi.vcvt %scale_u16 : ... -> !pto.vmi.vreg<256xui8>
 ```
 
 Expected MI/CCE shape:
@@ -188,11 +187,11 @@ CCE spend most of the loop repairing physical layout.
 VMI row body:
 
 ```mlir
-%x_f16 = pto.vmi.load %x_ub[%row_off] : ... -> !pto.vmi.vreg<256xf16>
-%x_f32 = pto.vmi.extf %x_f16 : ... -> !pto.vmi.vreg<256xf32>
-%scaled = pto.vmi.mulf %x_f32, %scale_f32 : ...
-%y_fp8 = pto.vmi.truncf %scaled : ... -> !pto.vmi.vreg<256xf8E4M3FN>
-pto.vmi.masked_store %y_fp8, %y_ub[%row_off], %mask : ...
+%x_f16 = pto.vmi.vload %x_ub[%row_off] : ... -> !pto.vmi.vreg<256xf16>
+%x_f32 = pto.vmi.vcvt %x_f16 : ... -> !pto.vmi.vreg<256xf32>
+%scaled = pto.vmi.vmul %x_f32, %scale_f32 : ...
+%y_fp8 = pto.vmi.vcvt %scaled : ... -> !pto.vmi.vreg<256xf8E4M3FN>
+pto.vmi.vstore %y_fp8, %y_ub[%row_off], %mask : ...
 ```
 
 The same row in MI/CCE needs:
@@ -235,10 +234,10 @@ removes important split-register ceremony.
 VMI shape:
 
 ```mlir
-%x_bits = pto.vmi.load %xAddr[%load_off] : ... -> !pto.vmi.vreg<256xui16>
-%x_exp = pto.vmi.andi %x_bits, %expMaskBF16 : ...
-%is_larger = pto.vmi.cmpi "slt", %acc, %x_exp : ...
-%acc_next = pto.vmi.select %is_larger, %x_exp, %acc : ...
+%x_bits = pto.vmi.vload %xAddr[%load_off] : ... -> !pto.vmi.vreg<256xui16>
+%x_exp = pto.vmi.vand %x_bits, %expMaskBF16 : ...
+%is_larger = pto.vmi.vcmp "slt", %acc, %x_exp : ...
+%acc_next = pto.vmi.vsel %is_larger, %x_exp, %acc : ...
 ```
 
 MI/CCE shape:
@@ -258,7 +257,7 @@ indices.
 After row accumulation:
 
 - MI/CCE use `vcgmax` to reduce within grouped lanes and broadcast results.
-- VMI names this as `group_reduce_maxi` plus `group_broadcast`.
+- VMI names this as `vcmax` plus `vbrc`.
 - MI/CCE use `vpack LOWER` for compact E8M0 bytes.
 - VMI names that semantic byte narrowing as `trunci`.
 
@@ -328,7 +327,7 @@ f32 lane -> [fp8_byte, 0, 0, 0]
 
 The reciprocal scale is stored as bf16 exponent fields. MI loads it with
 `E2B_B16`, bitcasts to bf16, and widens with `PART_EVEN`. VMI expresses this as
-logical `load` plus `extf`; lowering chooses the broadcast distribution.
+logical `vload` plus `vcvt`; lowering chooses the broadcast distribution.
 
 ### Common Bugs VMI Helps Avoid
 
@@ -353,8 +352,8 @@ Review checklist for VMI MX quant:
 
 1. Logical vector width matches the row shape (`256` lanes).
 2. Scale math still spells Inf/NaN, zero, clamp, and reciprocal edge cases.
-3. `extf` appears before fp32 multiply; `truncf` handles FP8/FP4 output;
-   `trunci` handles compact scale bytes.
+3. `vcvt` appears before fp32 multiply and again for FP8/FP4 output and compact
+   scale bytes.
 4. Lowered MI for f16→fp8 has the expected `DINTLV_B16`, `PART_EVEN/ODD`,
    `vintlv`, `PART_P0`, and four `PK4_B32` stores.
 5. For CCE comparison, start from the `Expected UB effect` block and then read

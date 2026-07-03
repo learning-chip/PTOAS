@@ -80,8 +80,8 @@ arithmetic is fp32 before narrowing back to bf16. This matches
 ## 2. What VMI Changes
 
 VMI (`pto.vmi`) lets the author write logical vectors such as
-`!pto.vmi.vreg<64xbf16>` and semantic operations such as `vmi.load`,
-`vmi.extf`, `vmi.mulf`, `channel_split`, and `vmi.masked_store`.
+`!pto.vmi.vreg<64xbf16>` and semantic operations such as `pto.vmi.vload`,
+`pto.vmi.vcvt`, `pto.vmi.vmul`, `pto.vmi.vdintlv`, and `pto.vmi.vstore`.
 
 The compiler lowers that logical view to MI instructions with concrete:
 
@@ -92,12 +92,11 @@ The compiler lowers that logical view to MI instructions with concrete:
 
 The conversion names intentionally mirror MLIR `arith` vocabulary:
 
-- `pto.vmi.extf`: extend each logical lane to a wider floating type
-- `pto.vmi.truncf`: narrow each logical lane to the destination floating type
+- `pto.vmi.vcvt`: convert each logical lane to the destination type
 
 These names describe lane-wise meaning; they are not one-instruction promises. For example, bf16
-`extf` often lowers to an unpacked load plus `vcvt PART_EVEN`; bf16 `truncf`
-plus `masked_store` lowers to a narrow plus `PK_B32` store.
+`vcvt` often lowers to an unpacked load plus `vcvt PART_EVEN`; bf16 `vcvt`
+plus `vstore` lowers to a narrow plus `PK_B32` store.
 
 ---
 
@@ -107,10 +106,10 @@ Tag each instruction by role:
 
 | Role | Question | RoPE examples |
 |------|----------|---------------|
-| **MATH** | Does it change the numeric value? | `mulf`, `addf`, `subf`, `negf` |
-| **TYPE** | Does it change dtype while preserving lane `i`? | `extf`, `truncf`, `vcvt` |
+| **MATH** | Does it change the numeric value? | `vmul`, `vadd`, `vsub`, `vneg` |
+| **TYPE** | Does it change dtype while preserving lane `i`? | `vcvt` |
 | **LAYOUT** | Does it only move lanes or repair physical placement? | `UNPK_B16`, `PK_B32`, `PART_EVEN`, `vdintlv`, `vintlv` |
-| **MEMORY** | Does it cross the UB/register boundary? | `load`, `masked_store`, `vlds`, `vsts` |
+| **MEMORY** | Does it cross the UB/register boundary? | `vload`, `vstore`, `vlds`, `vsts` |
 
 VMI source mostly shows **MATH** and **TYPE**. MI/CCE show the **LAYOUT** and
 **MEMORY** work because the author is addressing physical vector registers.
@@ -119,13 +118,13 @@ VMI source mostly shows **MATH** and **TYPE**. MI/CCE show the **LAYOUT** and
 
 | Math intent | CCE / MI shape | VMI shape |
 |-------------|----------------|-----------|
-| Load a logical vector | `vlds NORM` or `vlds UNPK_B16` | `pto.vmi.load` |
-| Widen bf16/f16 to fp32 | `vcvt {part=EVEN/ODD}` | `pto.vmi.extf` |
-| Narrow fp32 to bf16/f16 | `vcvt {rnd, sat, part}` | `pto.vmi.truncf` |
-| Multiply / add / subtract | `vmul` / `vadd` / `vsub` + concrete mask | `vmi.mulf` / `addf` / `subf` |
-| Split adjacent pairs | `vdintlv` | `pto.vmi.channel_split` |
-| Merge even/odd streams | `vintlv` | `pto.vmi.channel_merge` |
-| Store active lanes | `vsts NORM_*` or `PK_B32` + mask | `pto.vmi.masked_store` |
+| Load a logical vector | `vlds NORM` or `vlds UNPK_B16` | `pto.vmi.vload` |
+| Widen bf16/f16 to fp32 | `vcvt {part=EVEN/ODD}` | `pto.vmi.vcvt` |
+| Narrow fp32 to bf16/f16 | `vcvt {rnd, sat, part}` | `pto.vmi.vcvt` |
+| Multiply / add / subtract | `vmul` / `vadd` / `vsub` + concrete mask | `pto.vmi.vmul` / `vadd` / `vsub` |
+| Split adjacent pairs | `vdintlv` | `pto.vmi.vdintlv` |
+| Merge even/odd streams | `vintlv` | `pto.vmi.vintlv` |
+| Store active lanes | `vsts NORM_*` or `PK_B32` + mask | `pto.vmi.vstore` |
 
 ### Expected Lowering Shapes
 
@@ -134,8 +133,8 @@ These are review expectations for the examples, not formal lowering rules.
 **bf16 load + widen in HALF mode:**
 
 ```mlir
-%x16 = pto.vmi.load %x_ub[%off] : ... -> !pto.vmi.vreg<64xbf16>
-%x32 = pto.vmi.extf %x16 : ... -> !pto.vmi.vreg<64xf32>
+%x16 = pto.vmi.vload %x_ub[%off] : ... -> !pto.vmi.vreg<64xbf16>
+%x32 = pto.vmi.vcvt %x16 : ... -> !pto.vmi.vreg<64xf32>
 ```
 
 Expected MI/CCE shape:
@@ -151,8 +150,8 @@ memory values into even physical lanes.
 **bf16 narrow + store:**
 
 ```mlir
-%y16 = pto.vmi.truncf %y32 : ... -> !pto.vmi.vreg<64xbf16>
-pto.vmi.masked_store %y16, %y_ub[%off], %mask : ...
+%y16 = pto.vmi.vcvt %y32 : ... -> !pto.vmi.vreg<64xbf16>
+pto.vmi.vstore %y16, %y_ub[%off], %mask : ...
 ```
 
 Expected MI/CCE shape:
@@ -162,15 +161,15 @@ Expected MI/CCE shape:
 pto.vsts %y16_phys, %y_ub[%off], %mask32 {dist = "PK_B32"} : ...
 ```
 
-`truncf` preserves logical lane order; `PK_B32` repairs the physical even-lane
+`vcvt` preserves logical lane order; `PK_B32` repairs the physical even-lane
 layout before the values are written densely to UB.
 
 **INTERLEAVE rotation helper:**
 
 ```mlir
-%even, %odd = "pto.vmi.channel_split"(%x) : ...
-%neg_odd = pto.vmi.negf %odd : ...
-%rot = "pto.vmi.channel_merge"(%neg_odd, %even) : ...
+%even, %odd = "pto.vmi.vdintlv"(%x) : ...
+%neg_odd = pto.vmi.vneg %odd : ...
+%rot = "pto.vmi.vintlv"(%neg_odd, %even) : ...
 ```
 
 Expected MI/CCE shape:
@@ -201,14 +200,14 @@ y2 = x2 * cos2 + x1 * sin2
 VMI source shape:
 
 ```mlir
-%cos1_16 = pto.vmi.load %cos_ub[%cos1_off] : ... -> !pto.vmi.vreg<64xf16>
-%cos1 = pto.vmi.extf %cos1_16 : ... -> !pto.vmi.vreg<64xf32>
-%x1 = pto.vmi.extf %x1_16 : ... -> !pto.vmi.vreg<64xf32>
-%x1_cos = pto.vmi.mulf %x1, %cos1 : ...
-%x2_sin = pto.vmi.mulf %x2, %sin1 : ...
-%out1_f32 = pto.vmi.subf %x1_cos, %x2_sin : ...
-%out1 = pto.vmi.truncf %out1_f32 : ... -> !pto.vmi.vreg<64xbf16>
-pto.vmi.masked_store %out1, %y_ub[%y1_off], %mask : ...
+%cos1_16 = pto.vmi.vload %cos_ub[%cos1_off] : ... -> !pto.vmi.vreg<64xf16>
+%cos1 = pto.vmi.vcvt %cos1_16 : ... -> !pto.vmi.vreg<64xf32>
+%x1 = pto.vmi.vcvt %x1_16 : ... -> !pto.vmi.vreg<64xf32>
+%x1_cos = pto.vmi.vmul %x1, %cos1 : ...
+%x2_sin = pto.vmi.vmul %x2, %sin1 : ...
+%out1_f32 = pto.vmi.vsub %x1_cos, %x2_sin : ...
+%out1 = pto.vmi.vcvt %out1_f32 : ... -> !pto.vmi.vreg<64xbf16>
+pto.vmi.vstore %out1, %y_ub[%y1_off], %mask : ...
 ```
 
 MI/CCE must expose:
@@ -230,8 +229,8 @@ UB dense bf16
   -> PK_B32 store:   UB dense bf16
 ```
 
-VMI collapses the layout protocol into `load`, `extf`, `truncf`, and
-`masked_store`, so the source reads as dtype-aware RoPE math.
+VMI collapses the layout protocol into `vload`, `vcvt`, and `vstore`, so the
+source reads as dtype-aware RoPE math.
 
 ---
 
@@ -241,20 +240,20 @@ For GPT-J layout, the useful mental model is:
 
 ```text
 x          = [x0, x1, x2, x3, ...]
-channel_split(x) -> even=[x0,x2,...], odd=[x1,x3,...]
-channel_merge(-odd, even) -> [-x1,x0,-x3,x2,...] = i*x
+vdintlv(x) -> even=[x0,x2,...], odd=[x1,x3,...]
+vintlv(-odd, even) -> [-x1,x0,-x3,x2,...] = i*x
 y = x*cos + (i*x)*sin
 ```
 
 VMI complex-multiply shape:
 
 ```mlir
-%x_even, %x_odd = "pto.vmi.channel_split"(%x) : ...
-%neg_x_odd = pto.vmi.negf %x_odd : ...
-%rot = "pto.vmi.channel_merge"(%neg_x_odd, %x_even) : ...
-%x_cos = pto.vmi.mulf %x, %cos : ...
-%rot_sin = pto.vmi.mulf %rot, %sin : ...
-%y = pto.vmi.addf %x_cos, %rot_sin : ...
+%x_even, %x_odd = "pto.vmi.vdintlv"(%x) : ...
+%neg_x_odd = pto.vmi.vneg %x_odd : ...
+%rot = "pto.vmi.vintlv"(%neg_x_odd, %x_even) : ...
+%x_cos = pto.vmi.vmul %x, %cos : ...
+%rot_sin = pto.vmi.vmul %rot, %sin : ...
+%y = pto.vmi.vadd %x_cos, %rot_sin : ...
 ```
 
 The CCE and `rope_f16_v2.mi.pto` spelling is structurally the same but uses
@@ -274,7 +273,7 @@ so it is not line-for-line identical to CCE even though the math is equivalent.
 | **bf16 HALF** | Very large | UNPK → EVEN → fp32 compute → EVEN → PK, plus dual masks |
 | **bf16 INTERLEAVE** | Very large | bf16 conversion chain plus parity split/merge |
 | **f16 INTERLEAVE** | Large | `vdintlv`/`vintlv` and explicit negate stream |
-| **f32 INTERLEAVE** | Moderate | semantic `channel_split/merge`, fewer mask arguments |
+| **f32 INTERLEAVE** | Moderate | semantic `vdintlv/vintlv`, fewer mask arguments |
 | **f16 HALF** | Moderate | mask plumbing and 128-lane physical register width |
 | **f32 HALF** | Small | MI is already close to math; VMI mostly removes masks |
 
@@ -328,7 +327,7 @@ memory:       [y0, y1, y2, ...]
 even/odd --vintlv--> [even0,odd0,even1,odd1,...]
 ```
 
-VMI names these as `channel_split` and `channel_merge`.
+VMI names these as `vdintlv` and `vintlv`.
 
 ### Mask Families
 
@@ -344,7 +343,7 @@ Using the wrong mask family is a wrong-lane bug. VMI uses a logical
 
 - using `PART_ODD` after `UNPK_B16`
 - using `NORM_B16` instead of `PK_B32` after bf16 narrow
-- swapping `channel_merge(neg_odd, even)` to `channel_merge(even, neg_odd)`
+- swapping `vintlv(neg_odd, even)` to `vintlv(even, neg_odd)`
 - mixing b16 and b32 predicates in bf16 paths
 
 ---
@@ -363,7 +362,7 @@ Review checklist for VMI RoPE:
 1. Logical vector width matches the slice (`32` for HALF halves, `64` for D=64
    interleaved rows).
 2. bf16 paths widen to fp32 and narrow back to bf16.
-3. INTERLEAVE complex multiply uses `channel_merge(neg_odd, even)`.
+3. INTERLEAVE complex multiply uses `vintlv(neg_odd, even)`.
 4. Lowered MI contains the expected `UNPK_B16`/`PART_EVEN`/`PK_B32` sequence for
    bf16 and `vdintlv`/`vintlv` for interleave.
 5. For CCE comparison, start with the `Expected UB effect` block and register

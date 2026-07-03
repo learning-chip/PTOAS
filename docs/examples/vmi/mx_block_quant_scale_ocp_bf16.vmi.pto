@@ -40,14 +40,14 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
       //
       //   MI 写法                                VMI 写法
       //   --------------------------------       --------------------------------
-      //   vldsx2 + DINTLV_B16 拆成 2路128         vmi.load 逻辑向量 256
+      //   vldsx2 + DINTLV_B16 拆成 2路128         pto.vmi.vload 逻辑向量 256
       //   vbr 广播常量到 128 宽                    vmi.broadcast 广播到 256 宽
       //   2个独立累加器 (因 DINTLV 拆分)            1个累加器 (逻辑连续向量)
-      //   vand/vcmp/vsel/vsub + mask<b16>         vmi.andi/cmpi/select/subi (无mask)
-      //   vcgmax 隐式归约+广播                      group_reduce_maxi + group_broadcast 显式两步
+      //   vand/vcmp/vsel/vsub + mask<b16>         pto.vmi.vand/vcmp/vsel/vsub (无mask)
+      //   vcgmax 隐式归约+广播                      pto.vmi.vcmax + pto.vmi.vbrc 显式两步
       //   vpack LOWER 打包字节                      vmi.trunci 语义截断
       //   vsts + NORM_B8/B16 + mask<b8/b16>       vmi.store (无mask, 无dist模式)
-      //   pset_b16/pge_b8/pge_b16 多种mask         vmi.create_mask 统一mask类型
+      //   pset_b16/pge_b8/pge_b16 多种mask         pto.vmi.pset 统一mask类型
       //
       // ========================================================================
 
@@ -67,63 +67,63 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
         // - Special cases match the MI/CCE path: Inf/NaN -> E8M0 0xFF and bf16 NaN
         //   reciprocal; all-zero -> scale 0 and reciprocal 0; invalid reciprocal
         //   edge -> specialExp.
-        // VMI: create_mask 逻辑长度 256 创建统一 mask。
+        // VMI: pset 为 256 宽逻辑向量创建全 active mask。
         // MI 对应: pset_b16 + pset_b8 + pge_b8 + pge_b16 四种 mask, 选错粒度即 bug。
 
         // Create one logical all-lanes predicate for 256-element VMI operations.
-        %mask256 = pto.vmi.create_mask %c256 : index -> !pto.vmi.mask<256xpred>
+        %mask256 = pto.vmi.pset "PAT_ALL" : !pto.vmi.mask<256xpred>
         // VMI: vmi.broadcast 广播标量到 256-wide 向量, 替代 MI 的 vbr(128-wide)。
         // MI 中这些常量(expMask/yMaxExp/bias/nan等) 均为 vreg<128xi16>,
         // 因 DINTLV_B16 拆出的两路各需要独立的常量寄存器。VMI 统一为 256 宽。
 
         // All-zero constants for compare/select defaults in i16 and i32 domains.
-        %zero16 = pto.vmi.broadcast %c0_i16 : i16 -> !pto.vmi.vreg<256xi16>
-        %zero32 = pto.vmi.broadcast %c0_i32 : i32 -> !pto.vmi.vreg<256xi32>
+        %zero16 = pto.vmi.vbrc %c0_i16 : i16 -> !pto.vmi.vreg<256xi16>
+        %zero32 = pto.vmi.vbrc %c0_i32 : i32 -> !pto.vmi.vreg<256xi32>
         // 0x7F80 keeps only the bf16 biased exponent bits [14:7].
-        %expMaskBF16 = pto.vmi.broadcast %c32640_i16 : i16 -> !pto.vmi.vreg<256xi16>
+        %expMaskBF16 = pto.vmi.vbrc %c32640_i16 : i16 -> !pto.vmi.vreg<256xi16>
         // Target-format max exponent encoded in bf16 exponent-field position.
-        %yMaxExpReg = pto.vmi.broadcast %yMaxExp : i16 -> !pto.vmi.vreg<256xi16>
+        %yMaxExpReg = pto.vmi.vbrc %yMaxExp : i16 -> !pto.vmi.vreg<256xi16>
         // 0x7F00 is the bf16 exponent field for bias 127, used for reciprocal scale.
-        %biasE8M0 = pto.vmi.broadcast %c32512_i16 : i16 -> !pto.vmi.vreg<256xi16>
+        %biasE8M0 = pto.vmi.vbrc %c32512_i16 : i16 -> !pto.vmi.vreg<256xi16>
         // Subnormal/special reciprocal threshold used by the CCE OCP path.
-        %specialExp = pto.vmi.broadcast %c64_i16 : i16 -> !pto.vmi.vreg<256xi16>
+        %specialExp = pto.vmi.vbrc %c64_i16 : i16 -> !pto.vmi.vreg<256xi16>
         // Custom bf16 NaN payload used when the block exponent is Inf/NaN.
-        %nanBF16 = pto.vmi.broadcast %c32641_i16 : i16 -> !pto.vmi.vreg<256xi16>
+        %nanBF16 = pto.vmi.vbrc %c32641_i16 : i16 -> !pto.vmi.vreg<256xi16>
         // E8M0 NaN encoding as i32 so it can be selected after the shift.
-        %nanE8M0_32 = pto.vmi.broadcast %c255_i32 : i32 -> !pto.vmi.vreg<256xi32>
+        %nanE8M0_32 = pto.vmi.vbrc %c255_i32 : i32 -> !pto.vmi.vreg<256xi32>
         // Per-lane shift amount. VMI shrui uses a vector rhs; MI vshrs uses an immediate.
-        %shift32 = pto.vmi.broadcast %c7_i32 : i32 -> !pto.vmi.vreg<256xi32>
+        %shift32 = pto.vmi.vbrc %c7_i32 : i32 -> !pto.vmi.vreg<256xi32>
 
         %expMaxRows16 = scf.for %i = %c0 to %row_count step %c1
             iter_args(%acc = %zero16) -> (!pto.vmi.vreg<256xi16>) {
           %loadOffset = arith.muli %i, %load_stride : index
-          // VMI: vmi.load 加载 256 个 bf16 (作为 ui16), 逻辑连续。
+          // VMI: pto.vmi.vload 加载 256 个 bf16 (作为 ui16), 逻辑连续。
           // MI 对应: vldsx2 + DINTLV_B16 -> 两个 vreg<128xbf16>, 偶数/奇数索引分离。
 
           // Load one logical 256-lane row of bf16 bits, represented as ui16.
-          %xBitsU16 = pto.vmi.load %xAddr[%loadOffset]
+          %xBitsU16 = pto.vmi.vload %xAddr[%loadOffset]
             : !pto.ptr<ui16, ub> -> !pto.vmi.vreg<256xui16>
-          // VMI: bitcast + andi 提取指数位 (bf16 指数在位[14:7])。
+          // VMI: vinterpret_cast + vand 提取指数位 (bf16 指数在位[14:7])。
           // MI 对应: vbitcast bf16->i16 + vand %mask<b16>——需要显式 mask。
 
           // Reinterpret ui16 lanes as signed i16 bit patterns for integer masking.
-          %xBits = pto.vmi.bitcast %xBitsU16
+          %xBits = pto.vmi.vinterpret_cast %xBitsU16
             : !pto.vmi.vreg<256xui16> -> !pto.vmi.vreg<256xi16>
           // Extract bf16 exponent field with 0x7F80.
-          %xExp = pto.vmi.andi %xBits, %expMaskBF16
+          %xExp = pto.vmi.vand %xBits, %expMaskBF16
             : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
             -> !pto.vmi.vreg<256xi16>
-          // VMI: cmpi + select 实现逐元素取 max——无 mask 参数。
+          // VMI: vcmp + vsel 实现逐元素取 max——无 mask 参数。
           // MI 对应: vmax %acc0, %x0ExpBF16, %pregAllB16——需要 mask<b16>。
           //   注意 MI 用硬件 vmax 指令, VMI 用 cmpi+select 组合——语义等价, 但 MI 的 vmax
           //   仍然需要 mask 参数而 VMI 的 cmpi/select 不需要。
 
           // Predicate lanes where the new row exponent exceeds the accumulator.
-          %takeNew = pto.vmi.cmpi "slt", %acc, %xExp
+          %takeNew = pto.vmi.vcmp "slt", %acc, %xExp
             : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
             -> !pto.vmi.mask<256xpred>
           // Select xExp for lanes with larger exponent, otherwise keep acc.
-          %nextAcc = pto.vmi.select %takeNew, %xExp, %acc
+          %nextAcc = pto.vmi.vsel %takeNew, %xExp, %acc
             : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi16>,
               !pto.vmi.vreg<256xi16>
             -> !pto.vmi.vreg<256xi16>
@@ -133,29 +133,28 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
         // ========================================================================
         // 阶段2: 跨行归约 - 将逐行 max 结果在 lane 维度上做全局 reduce_max
         //
-        // VMI: extsi 将 i16 符号扩展为 i32, 然后 group_reduce_maxi 显式归约到
-        //   标量 (vreg<1xi32>), 再用 group_broadcast 显式广播回 256 宽。
+        // VMI: vcvt 将 i16 符号扩展为 i32, 然后 vcmax 显式归约到
+        //   标量 (vreg<1xi32>), 再用 vbrc 显式广播回 256 宽。
         //   两步分离使数据流清晰: 归约 -> 广播, 各自独立控制。
         // MI 对应: vcgmax 隐式完成归约+广播——单条指令, 但归约结果和广播范围不可分离。
         // ========================================================================
 
-        // extsi mirrors MLIR arith.extsi on logical vector lanes: sign-extend
-        // each i16 exponent-field value to i32 so group_reduce_maxi has a wider
+        // vcvt sign-extends each i16 exponent-field value to i32 so vcmax has a wider
         // integer domain. MI keeps this path in i16 and uses vcgmax directly.
-        %expMaxRows32 = pto.vmi.extsi %expMaxRows16
+        %expMaxRows32 = pto.vmi.vcvt %expMaxRows16
           : !pto.vmi.vreg<256xi16> -> !pto.vmi.vreg<256xi32>
-        // group_reduce_maxi(num_groups=1): reduce all active lanes to one max.
+        // vcmax(group=1): reduce all active lanes to one max.
         // This separates "reduce" from "broadcast", unlike MI vcgmax which fuses them.
-        %expMaxScalar32 = pto.vmi.group_reduce_maxi %expMaxRows32, %mask256 {num_groups = 1}
+        %expMaxScalar32 = pto.vmi.vcmax %expMaxRows32, %mask256 {group = 1}
           : !pto.vmi.vreg<256xi32>, !pto.vmi.mask<256xpred>
           -> !pto.vmi.vreg<1xi32>
         // Broadcast the single block exponent back to every logical lane so the
         // following compare/select/sub/shift chain can remain element-wise.
-        %expMaxDim32 = pto.vmi.group_broadcast %expMaxScalar32 {num_groups = 1}
+        %expMaxDim32 = pto.vmi.vbrc %expMaxScalar32 {group = 1}
           : !pto.vmi.vreg<1xi32> -> !pto.vmi.vreg<256xi32>
         // trunci mirrors MLIR arith.trunci: keep the low 16 bits of each logical
         // lane after reduction. It is a typed semantic cast, not a hardware vpack.
-        %expMaxDim0 = pto.vmi.trunci %expMaxDim32
+        %expMaxDim0 = pto.vmi.vcvt %expMaxDim32
           : !pto.vmi.vreg<256xi32> -> !pto.vmi.vreg<256xi16>
 
         // ========================================================================
@@ -164,80 +163,80 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
         // 算法: if isLeYMax -> clamp to yMaxExp; exp = exp - yMaxExp; scale = exp >> 7
         //        if isInfOrNan -> scale = nanE8M0; if isZero -> scale = 0
         //
-        // VMI: cmpi/select/subi/shrui 均为无 mask 指令, 逻辑清晰。
+        // VMI: vcmp/vsel/vsub/vshrs 均为无 mask 指令, 逻辑清晰。
         // MI 对应: vcmp/vsel/vsub/vshrs——每条都需 mask<b16>。
         // ========================================================================
 
         // Detect bf16 Inf/NaN exponent field (0x7F80).
-        %isInfOrNan = pto.vmi.cmpi "eq", %expMaxDim0, %expMaskBF16
+        %isInfOrNan = pto.vmi.vcmp "eq", %expMaxDim0, %expMaskBF16
           : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
           -> !pto.vmi.mask<256xpred>
         // Detect all-zero exponent field.
-        %isZero = pto.vmi.cmpi "eq", %expMaxDim0, %zero16
+        %isZero = pto.vmi.vcmp "eq", %expMaxDim0, %zero16
           : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
           -> !pto.vmi.mask<256xpred>
         // Detect expMax <= yMaxExp; written as yMaxExp >= expMax.
-        %isLeYMax = pto.vmi.cmpi "ge", %yMaxExpReg, %expMaxDim0
+        %isLeYMax = pto.vmi.vcmp "ge", %yMaxExpReg, %expMaxDim0
           : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
           -> !pto.vmi.mask<256xpred>
         // Clamp too-small exponent blocks to yMaxExp.
-        %expMaxDim1 = pto.vmi.select %isLeYMax, %yMaxExpReg, %expMaxDim0
+        %expMaxDim1 = pto.vmi.vsel %isLeYMax, %yMaxExpReg, %expMaxDim0
           : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi16>,
             !pto.vmi.vreg<256xi16>
           -> !pto.vmi.vreg<256xi16>
         // Compute exponent delta in bf16 exponent-field units.
-        %expMaxDim2 = pto.vmi.subi %expMaxDim1, %yMaxExpReg
+        %expMaxDim2 = pto.vmi.vsub %expMaxDim1, %yMaxExpReg
           : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
           -> !pto.vmi.vreg<256xi16>
 
         // Widen the exponent difference before logical right shift. Keeping this
         // in i32 makes the subsequent trunci-to-ui8 explicit at the VMI level.
-        %expMaxShift32 = pto.vmi.extsi %expMaxDim2
+        %expMaxShift32 = pto.vmi.vcvt %expMaxDim2
           : !pto.vmi.vreg<256xi16> -> !pto.vmi.vreg<256xi32>
         // Shift bf16 exponent-field units down by 7 to obtain E8M0 byte values.
         // MI spells this as vshrs with a scalar shift count and a b16 mask.
-        %mxScaleI32_0 = pto.vmi.shrui %expMaxShift32, %shift32
+        %mxScaleI32_0 = pto.vmi.vshrs %expMaxShift32, %shift32
           : !pto.vmi.vreg<256xi32>, !pto.vmi.vreg<256xi32>
           -> !pto.vmi.vreg<256xi32>
         // Inf/NaN block: replace computed scale with E8M0 NaN (0xFF).
-        %mxScaleI32_1 = pto.vmi.select %isInfOrNan, %nanE8M0_32, %mxScaleI32_0
+        %mxScaleI32_1 = pto.vmi.vsel %isInfOrNan, %nanE8M0_32, %mxScaleI32_0
           : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi32>,
             !pto.vmi.vreg<256xi32>
           -> !pto.vmi.vreg<256xi32>
         // All-zero block: force scale byte to zero after the Inf/NaN override.
-        %mxScaleI32_2 = pto.vmi.select %isZero, %zero32, %mxScaleI32_1
+        %mxScaleI32_2 = pto.vmi.vsel %isZero, %zero32, %mxScaleI32_1
           : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi32>,
             !pto.vmi.vreg<256xi32>
           -> !pto.vmi.vreg<256xi32>
-        // VMI: trunci 语义截断 i32->ui8, 一举替代 MI 的 vpack LOWER 指令。
+        // VMI: vcvt 语义截断 i32->ui8, 一举替代 MI 的 vpack LOWER 指令。
         // MI 对应: vpack %mxScaleB16_2, "LOWER" -> vreg<256xui8>。
         //   vpack 需要指定 LOWER/UPPER 半区, 开发者需理解 bf16 高低位关系。
 
         // Narrow full scale vector to ui8 bytes for scale2-style storage.
-        %mxScale1Full = pto.vmi.trunci %mxScaleI32_2
+        %mxScale1Full = pto.vmi.vcvt %mxScaleI32_2
           : !pto.vmi.vreg<256xi32> -> !pto.vmi.vreg<256xui8>
 
         // 16 bf16 words for reciprocal.
-        // VMI: group_reduce_maxi(num_groups=64) 将 256 宽按 64 组归约 -> 64 个 scale1 字节。
+        // VMI: vcmax(group=64) 将 256 宽按 64 组归约 -> 64 个 scale1 字节。
         //     不同于前面的全规约(num_groups=1), 这里每 4 lane 归约出一个 scale1 字节。
 
-        // group_reduce_maxi(num_groups=64): reduce each 4-lane group to one value.
+        // vcmax(group=64): reduce each 4-lane group to one value.
         // This produces the 64 scale bytes used by the row-wise scale1 stores.
-        %mxScale1Rows32 = pto.vmi.group_reduce_maxi %mxScaleI32_2, %mask256 {num_groups = 64}
+        %mxScale1Rows32 = pto.vmi.vcmax %mxScaleI32_2, %mask256 {group = 64}
           : !pto.vmi.vreg<256xi32>, !pto.vmi.mask<256xpred>
           -> !pto.vmi.vreg<64xi32>
         // Typed narrowing to ui8 replaces MI vpack LOWER. The source is already
         // an integer scale byte value in each logical lane.
-        %mxScale1Rows = pto.vmi.trunci %mxScale1Rows32
+        %mxScale1Rows = pto.vmi.vcvt %mxScale1Rows32
           : !pto.vmi.vreg<64xi32> -> !pto.vmi.vreg<64xui8>
 
         scf.for %i = %c0 to %row_count step %c1 {
           %scaleOff = arith.muli %i, %ub_block : index
-          // VMI: vmi.store 直接写回——无 dist 模式, 无 mask 参数。
+          // VMI: pto.vmi.vstore 直接写回——无 dist 模式, 无 mask 参数。
           // MI 对应: vsts + {dist="NORM_B8"} + mask<b8>。
 
           // Store the compact 64-byte scale1 row.
-          pto.vmi.store %mxScale1Rows, %mxScale1Addr[%scaleOff]
+          pto.vmi.vstore %mxScale1Rows, %mxScale1Addr[%scaleOff]
             : !pto.vmi.vreg<64xui8>, !pto.ptr<ui8, ub>
         }
 
@@ -246,57 +245,57 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
         // MI 对应: vlds gatherIndex -> vselr(mxScale1, gatherIndex) -> vsts NORM_B8。
 
         // Store the full 256-byte scale2 vector.
-        pto.vmi.store %mxScale1Full, %mxScale2Addr[%c0]
+        pto.vmi.vstore %mxScale1Full, %mxScale2Addr[%c0]
           : !pto.vmi.vreg<256xui8>, !pto.ptr<ui8, ub>
 
         // ========================================================================
         // 阶段4: reciprocal scale 计算 - reversed = bias - exp, 含边界处理
-        // VMI: subi + select 链 (inf/nan -> nan, zero -> 0, invalid -> special)
+        // VMI: vsub + vsel 链 (inf/nan -> nan, zero -> 0, invalid -> special)
         // MI 对应: vsub + vsel 链——每条带 mask<b16>。
         // ========================================================================
 
         // Detect reciprocal edge case where exponent delta equals bf16 bias.
-        %invalidRecipMask = pto.vmi.cmpi "eq", %expMaxDim2, %biasE8M0
+        %invalidRecipMask = pto.vmi.vcmp "eq", %expMaxDim2, %biasE8M0
           : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
           -> !pto.vmi.mask<256xpred>
         // Compute reciprocal exponent field: bias - exponent_delta.
-        %reversedShareExp0 = pto.vmi.subi %biasE8M0, %expMaxDim2
+        %reversedShareExp0 = pto.vmi.vsub %biasE8M0, %expMaxDim2
           : !pto.vmi.vreg<256xi16>, !pto.vmi.vreg<256xi16>
           -> !pto.vmi.vreg<256xi16>
         // Override reciprocal with bf16 NaN for Inf/NaN blocks.
-        %reversedShareExp1 = pto.vmi.select %isInfOrNan, %nanBF16, %reversedShareExp0
+        %reversedShareExp1 = pto.vmi.vsel %isInfOrNan, %nanBF16, %reversedShareExp0
           : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi16>,
             !pto.vmi.vreg<256xi16>
           -> !pto.vmi.vreg<256xi16>
         // Override reciprocal with zero for zero blocks.
-        %reversedShareExp2 = pto.vmi.select %isZero, %zero16, %reversedShareExp1
+        %reversedShareExp2 = pto.vmi.vsel %isZero, %zero16, %reversedShareExp1
           : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi16>,
             !pto.vmi.vreg<256xi16>
           -> !pto.vmi.vreg<256xi16>
         // Override invalid reciprocal edge with special exponent threshold.
-        %reversedShareExp3 = pto.vmi.select %invalidRecipMask, %specialExp, %reversedShareExp2
+        %reversedShareExp3 = pto.vmi.vsel %invalidRecipMask, %specialExp, %reversedShareExp2
           : !pto.vmi.mask<256xpred>, !pto.vmi.vreg<256xi16>,
             !pto.vmi.vreg<256xi16>
           -> !pto.vmi.vreg<256xi16>
 
         // Reciprocal values are still bf16 exponent fields in i16 lanes. Widen
         // before grouped reduction, then narrow to ui16 for the UB destination.
-        %reversedShareExp32 = pto.vmi.extsi %reversedShareExp3
+        %reversedShareExp32 = pto.vmi.vcvt %reversedShareExp3
           : !pto.vmi.vreg<256xi16> -> !pto.vmi.vreg<256xi32>
-        // group_reduce_maxi(num_groups=16): choose the per-row reciprocal values
+        // vcmax(group=16): choose the per-row reciprocal values
         // that the MI path stores with a reduce-width b16 predicate.
-        %reversedRows32 = pto.vmi.group_reduce_maxi %reversedShareExp32, %mask256 {num_groups = 16}
+        %reversedRows32 = pto.vmi.vcmax %reversedShareExp32, %mask256 {group = 16}
           : !pto.vmi.vreg<256xi32>, !pto.vmi.mask<256xpred>
           -> !pto.vmi.vreg<16xi32>
         // trunci to ui16 is a semantic bit-width narrowing for storage. MI uses
         // vbitcast i16->ui16 followed by vsts NORM_B16.
-        %reversedRows = pto.vmi.trunci %reversedRows32
+        %reversedRows = pto.vmi.vcvt %reversedRows32
           : !pto.vmi.vreg<16xi32> -> !pto.vmi.vreg<16xui16>
-        // VMI: group_reduce_maxi(num_groups=16) 归约到 16 个 bf16 reciprocal 值, 写入 UB。
+        // VMI: vcmax(group=16) 归约到 16 个 bf16 reciprocal 值, 写入 UB。
         // MI 对应: vsts + {dist="NORM_B16"} + mask<b16> + vbitcast i16->ui16。
 
         // Store compact reciprocal halfwords.
-        pto.vmi.store %reversedRows, %mxScaleReciprocalAddr[%c0]
+        pto.vmi.vstore %reversedRows, %mxScaleReciprocalAddr[%c0]
           : !pto.vmi.vreg<16xui16>, !pto.ptr<ui16, ub>
       }
 

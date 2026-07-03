@@ -55,17 +55,17 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
       //
       // 算法流程 (与 MI 版本完全一致):
       //   1. 加载 reciprocal scale (bf16) -> 提升到 f32
-      //   2. 逐行: load f16 -> extf 提升 f32 -> mulf 乘 scale -> truncf 截断 fp8 -> store
+      //   2. 逐行: vload f16 -> vcvt 提升 f32 -> vmul 乘 scale -> vcvt 截断 fp8 -> vstore
       //
       // VMI 相比 MI 的核心简化 (参考 vmi-design-comparison.md 第3节):
       //
       //   MI 写法 (loop body 17 条指令)          VMI 写法 (loop body 5 条指令)
       //   ---------------------------------       ------------------------------
-      //   vldsx2 + DINTLV_B16 交错拆成 low/high   vmi.load (逻辑连续向量 vreg<256>)
-      //   4x vcvt EVEN/ODD -> 4路 f32 交织         1x vmi.extf (语义精度提升)
-      //   4x vmul + mask<b32>                     1x vmi.mulf (无 mask 参数)
-      //   4x vcvt P0~P3 + rnd/sat                 1x vmi.truncf (自动舍入/饱和)
-      //   3x vor + vbitcast + 4x vsts PK4_B32      1x vmi.masked_store (自动打包)
+      //   vldsx2 + DINTLV_B16 交错拆成 low/high   pto.vmi.vload (逻辑连续向量 vreg<256>)
+      //   4x vcvt EVEN/ODD -> 4路 f32 交织         1x pto.vmi.vcvt (语义精度提升)
+      //   4x vmul + mask<b32>                     1x pto.vmi.vmul (无 mask 参数)
+      //   4x vcvt P0~P3 + rnd/sat                 1x pto.vmi.vcvt (自动舍入/饱和)
+      //   3x vor + vbitcast + 4x vsts PK4_B32      1x pto.vmi.vstore (自动打包)
       //
       //   数据排布: 交错分散在多个寄存器            逻辑连续向量，编译器处理物理排布
       //   mask粒度: b16/b32/b8 三种分别维护         1 个 vmi.mask<256>
@@ -84,26 +84,26 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
       // - VMI keeps the row as one logical 256-lane vector. Lowering still performs
       //   the MI split/convert/pack work needed to write dense fp8 bytes.
       // x_ub and scale_ub are read-only from the vector compute perspective.
-        // VMI: create_mask 用逻辑长度创建统一 mask。
+        // VMI: plt 用逻辑长度创建统一 mask。
         // MI 对应: pset_b16 + pset_b32 + pset_b8 三种粒度分别维护。
 
-      // VMI: create_mask builds a logical predicate for the 256-element row.
+      // VMI: plt builds a logical predicate for the 256-element row.
       // Lowering chooses the concrete b16/b32/b8 mask families needed by the
       // MI load/convert/multiply/store sequence. Algorithm code carries one mask.
-      %full_mask = pto.vmi.create_mask %col_count : index -> !pto.vmi.mask<256xpred>
+      %full_mask, %mask_next = pto.vmi.plt %col_count : index -> !pto.vmi.mask<256xpred>, index
 
-      // VMI: vmi.load reads the reciprocal scale as a logical 256xbf16 vector.
+      // VMI: pto.vmi.vload reads the reciprocal scale as a logical 256xbf16 vector.
       // MI/CCE counterpart: vlds {dist="E2B_B16"} broadcasts block reciprocal
       // scale values into a physical b16 layout, then vbitcast ui16->bf16 and
       // vcvt {part="EVEN"} expose the values as f32. The VMI load names the
       // logical data contract; the compiler owns the E2B_B16 placement.
 
-      %scale_bf16 = pto.vmi.load %scale_ub[%c0]
+      %scale_bf16 = pto.vmi.vload %scale_ub[%c0]
         : !pto.ptr<bf16, ub> -> !pto.vmi.vreg<256xbf16>
-      // extf mirrors MLIR arith.extf on an abstract vector register:
+      // vcvt mirrors the typed element conversion on an abstract vector register:
       // for every logical lane i, produce f32(scale_bf16[i]). It is not a
       // promise of one hardware vcvt; lowering may emit E2B/part-specific MI.
-      %scale_fp32 = pto.vmi.extf %scale_bf16
+      %scale_fp32 = pto.vmi.vcvt %scale_bf16
         : !pto.vmi.vreg<256xbf16> -> !pto.vmi.vreg<256xf32>
 
       scf.for %row = %c0 to %row_count step %c1 {
@@ -112,29 +112,29 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
         %row_off = arith.muli %row, %col_count : index
         // ========================================================================
         // 逐行量化执行路径 - VMI 版本 (5 个语义动作)
-        // 每次处理一行 256 个 f16 元素: load -> extf -> mulf -> truncf -> store
+        // 每次处理一行 256 个 f16 元素: vload -> vcvt -> vmul -> vcvt -> vstore
         //
-        // (1) VMI: vmi.load 加载逻辑连续向量 256xf16。
+        // (1) VMI: pto.vmi.vload 加载逻辑连续向量 256xf16。
         //     MI 对应: vldsx2 %xHalf[%blockBase], DINTLV_B16
         //       -> low(128xf16)=偶数索引, high(128xf16)=奇数索引
         //       数据从加载开始就以交错方式分散，开发者需追踪索引映射。
         //     VMI 编译器自行决定物理排布，开发者只看到 256 个连续元素。
         // ========================================================================
 
-        %x_f16 = pto.vmi.load %x_ub[%row_off]
+        %x_f16 = pto.vmi.vload %x_ub[%row_off]
           : !pto.ptr<f16, ub> -> !pto.vmi.vreg<256xf16>
-        // (2) VMI: extf 将 256 个 f16 语义提升为 256 个 f32 - 无需 part 选择。
+        // (2) VMI: vcvt 将 256 个 f16 语义提升为 256 个 f32 - 无需 part 选择。
         //     MI 对应: 4 条 vcvt, low->EVEN/ODD, high->EVEN/ODD
         //       -> 4 个 vreg<64xf32>, 原始索引步长变成 4
         //       DINTLV_B16 拆出的 low/high 各需再拆 EVEN/ODD (f16->f32 位宽减半),
         //       开发者必须理解嵌套的交错映射关系。
         //     VMI 编译器追踪数据来源，自动选择正确的 part。
-        //     Semantically this is arith.extf lifted from scalar/vector IR to
+        //     Semantically this is a typed lane conversion lifted from scalar/vector IR to
         //     abstract vector registers: logical lane i stays lane i.
 
-        %x_fp32 = pto.vmi.extf %x_f16
+        %x_fp32 = pto.vmi.vcvt %x_f16
           : !pto.vmi.vreg<256xf16> -> !pto.vmi.vreg<256xf32>
-        // (3) VMI: mulf 一条指令完成 256 个 f32 乘 scale - 无 mask 参数。
+        // (3) VMI: vmul 一条指令完成 256 个 f32 乘 scale - 无 mask 参数。
         //     MI 对应: 4 条 vmul, 每条绑定 mask<b32>
         //       %x0Zero1 = vmul %x0Zero0, %scaleForMulFP32, %pregAllB32
         //       %x0One1  = vmul %x0One0,  %scaleForMulFP32, %pregAllB32
@@ -144,26 +144,26 @@ module attributes {pto.target_arch = "a5", pto.kernel_kind = #pto.kernel_kind<ve
         //     This is the only arithmetic operation in the quant stage:
         //       scaled[i] = f32(x[i]) * f32(reciprocal_scale[i]).
 
-        %res_fp32 = pto.vmi.mulf %x_fp32, %scale_fp32
+        %res_fp32 = pto.vmi.vmul %x_fp32, %scale_fp32
           : !pto.vmi.vreg<256xf32>, !pto.vmi.vreg<256xf32>
          -> !pto.vmi.vreg<256xf32>
-        // (4) VMI: truncf 将 256 个 f32 语义截断为 256 个 fp8_e4m3 - 无需手写参数。
+        // (4) VMI: vcvt 将 256 个 f32 语义截断为 256 个 fp8_e4m3 - 无需手写参数。
         //     MI 对应: 4 条 vcvt, 每条都需显式指定 {rnd=R, sat=SAT, part=P0}
         //       %x0ZeroFP8 = vcvt %x0Zero, %pregAllB32 {rnd=R, sat=SAT, part=P0}
         //       ...共 4 条, 每条都需 rnd(舍入模式)/sat(饱和溢出)/part(P0~P3)。
         //     MI 还需要 bitcast 类型重解释和 PK4_B32 store 打包。
         //     VMI 编译器根据目标类型自动填入正确的舍入/饱和参数, 并自动处理 part 打包。
-        //     Like MLIR arith.truncf, this is a semantic type narrowing; the
+        //     This is a semantic type narrowing; the
         //     final hardware sequence is determined by the target fp8 storage layout.
 
-        %res_fp8 = pto.vmi.truncf %res_fp32
+        %res_fp8 = pto.vmi.vcvt %res_fp32
           : !pto.vmi.vreg<256xf32> -> !pto.vmi.vreg<256xf8E4M3FN>
-        // (5) VMI: masked_store 统一掩码写回, 编译器自动处理打包策略。
+        // (5) VMI: vstore 统一掩码写回, 编译器自动处理打包策略。
         //     MI 对应: 4 条 vsts, 每条绑定 mask<b32> + {dist=PK4_B32}
         //       且 store 前还需 vbitcast fp8->ui8。
         //     VMI 编译器自动选择 PK 策略, 无需开发者关心打包和 bitcast。
 
-        pto.vmi.masked_store %res_fp8, %y_ub[%row_off], %full_mask
+        pto.vmi.vstore %res_fp8, %y_ub[%row_off], %full_mask
           : !pto.vmi.vreg<256xf8E4M3FN>, !pto.ptr<f8E4M3FN, ub>, !pto.vmi.mask<256xpred>
       }
     }
