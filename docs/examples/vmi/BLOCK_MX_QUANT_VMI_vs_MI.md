@@ -110,17 +110,17 @@ VMI keeps **MATH** and **TYPE** in the source. MI/CCE expose **LAYOUT** and
 
 | Math intent | CCE / MI shape | VMI shape |
 |-------------|----------------|-----------|
-| Load 256 b16 values | `vldsx2 DINTLV_B16` | `pto.vmi.vload` |
-| Extract bf16 exponent bits | `vand` + b16 mask | `pto.vmi.vand` |
+| Load 256 b16 values | `pto.mi.vldsx2 DINTLV_B16` | `pto.vmi.vload` |
+| Extract bf16 exponent bits | `pto.mi.vand` + b16 mask | `pto.vmi.vand` |
 | Running max | `vmax` over two split accumulators | `vcmp` + `vsel` over one logical vector |
-| Group max | `vcgmax` | `pto.vmi.vcmax` + `pto.vmi.vbrc` |
-| Scale byte narrowing | `vpack LOWER` | `pto.vmi.vcvt` |
-| Load reciprocal scale | `vlds E2B_B16` + bitcast + `vcvt EVEN` | `pto.vmi.vload` + `pto.vmi.vcvt` |
-| Widen f16 to fp32 | 4x `vcvt EVEN/ODD` | `pto.vmi.vcvt` |
+| Group max | `pto.mi.vcgmax` | `pto.vmi.vcmax` + `pto.vmi.vbrc` |
+| Scale byte narrowing | `pto.mi.vpack LOWER` | `pto.vmi.vcvt` |
+| Load reciprocal scale | `pto.mi.vlds E2B_B16` + bitcast + `pto.mi.vcvt EVEN` | `pto.vmi.vload` + `pto.vmi.vcvt` |
+| Widen f16 to fp32 | 4x `pto.mi.vcvt EVEN/ODD` | `pto.vmi.vcvt` |
 | Repair widened layout | 4x `vintlv` | compiler lowering |
-| fp32 multiply | 4x `vmul` + b32 mask | `pto.vmi.vmul` |
-| fp32 to fp8 | 4x `vcvt {P0,rnd=R,sat=SAT}` | `pto.vmi.vcvt` |
-| Store fp8 row | 4x `vsts PK4_B32` | `pto.vmi.vstore` |
+| fp32 multiply | 4x `pto.mi.vmul` + b32 mask | `pto.vmi.vmul` |
+| fp32 to fp8 | 4x `pto.mi.vcvt {P0,rnd=R,sat=SAT}` | `pto.vmi.vcvt` |
+| Store fp8 row | 4x `pto.mi.vsts PK4_B32` | `pto.vmi.vstore` |
 
 ### Expected Lowering Shapes
 
@@ -134,9 +134,9 @@ VMI keeps **MATH** and **TYPE** in the source. MI/CCE expose **LAYOUT** and
 Expected MI/CCE shape:
 
 ```mlir
-%x0, %x1 = pto.vldsx2 %xHalf[%row_off], "DINTLV_B16" : ...
-%x0_even = pto.vcvt %x0, %mask16 {part = "EVEN"} : ... -> !pto.vreg<64xf32>
-%x0_odd  = pto.vcvt %x0, %mask16 {part = "ODD"}  : ... -> !pto.vreg<64xf32>
+%x0, %x1 = pto.mi.vldsx2 %xHalf[%row_off], "DINTLV_B16" : ...
+%x0_even = pto.mi.vcvt %x0, %mask16 {part = "EVEN"} : ... -> !pto.mi.vreg<64xf32>
+%x0_odd  = pto.mi.vcvt %x0, %mask16 {part = "ODD"}  : ... -> !pto.mi.vreg<64xf32>
 // same for x1, followed by vintlv repair before fp8 conversion
 ```
 
@@ -153,9 +153,9 @@ pto.vmi.vstore %y_fp8, %y_ub[%row_off], %mask : ...
 Expected MI/CCE shape:
 
 ```mlir
-%chunk_fp8 = pto.vcvt %chunk_f32, %mask32 {part = "P0", rnd = "R", sat = "SAT"} : ...
-%chunk_u8 = pto.vbitcast %chunk_fp8 : ...
-pto.vsts %chunk_u8, %y_ub[%off], %mask8 {dist = "PK4_B32"} : ...
+%chunk_fp8 = pto.mi.vcvt %chunk_f32, %mask32 {part = "P0", rnd = "R", sat = "SAT"} : ...
+%chunk_u8 = pto.mi.vbitcast %chunk_fp8 : ...
+pto.mi.vsts %chunk_u8, %y_ub[%off], %mask8 {dist = "PK4_B32"} : ...
 // repeated at byte offsets 0, 64, 128, 192
 ```
 
@@ -171,7 +171,7 @@ pto.vsts %chunk_u8, %y_ub[%off], %mask8 {dist = "PK4_B32"} : ...
 Expected MI/CCE shape:
 
 ```mlir
-%scale_u8 = pto.vpack %scale_u16, "LOWER" : !pto.vreg<128xi16> -> !pto.vreg<256xui8>
+%scale_u8 = pto.mi.vpack %scale_u16, "LOWER" : !pto.mi.vreg<128xi16> -> !pto.mi.vreg<256xui8>
 ```
 
 Only the first eight scale bytes are meaningful in the default 256-column row;
@@ -243,11 +243,11 @@ VMI shape:
 MI/CCE shape:
 
 ```mlir
-%x0, %x1 = pto.vldsx2 %xBf[%load_off], "DINTLV_B16" : ...
-%x0_exp = pto.vand %x0_bits, %expMaskBF16, %pregAllB16 : ...
-%x1_exp = pto.vand %x1_bits, %expMaskBF16, %pregAllB16 : ...
-%acc0 = pto.vmax %acc0, %x0_exp, %pregAllB16 : ...
-%acc1 = pto.vmax %acc1, %x1_exp, %pregAllB16 : ...
+%x0, %x1 = pto.mi.vldsx2 %xBf[%load_off], "DINTLV_B16" : ...
+%x0_exp = pto.mi.vand %x0_bits, %expMaskBF16, %pregAllB16 : ...
+%x1_exp = pto.mi.vand %x1_bits, %expMaskBF16, %pregAllB16 : ...
+%acc0 = pto.mi.vmax %acc0, %x0_exp, %pregAllB16 : ...
+%acc1 = pto.mi.vmax %acc1, %x1_exp, %pregAllB16 : ...
 ```
 
 The math is “extract exponent and take a running max.” MI/CCE must track two
@@ -256,9 +256,9 @@ indices.
 
 After row accumulation:
 
-- MI/CCE use `vcgmax` to reduce within grouped lanes and broadcast results.
+- MI/CCE use `pto.mi.vcgmax` to reduce within grouped lanes and broadcast results.
 - VMI names this as `vcmax` plus `vbrc`.
-- MI/CCE use `vpack LOWER` for compact E8M0 bytes.
+- MI/CCE use `pto.mi.vpack LOWER` for compact E8M0 bytes.
 - VMI names that semantic byte narrowing as `trunci`.
 
 The scale path does not need the four-stream f32 `vintlv` repair from the quant

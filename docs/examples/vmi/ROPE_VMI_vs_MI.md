@@ -118,13 +118,13 @@ VMI source mostly shows **MATH** and **TYPE**. MI/CCE show the **LAYOUT** and
 
 | Math intent | CCE / MI shape | VMI shape |
 |-------------|----------------|-----------|
-| Load a logical vector | `vlds NORM` or `vlds UNPK_B16` | `pto.vmi.vload` |
-| Widen bf16/f16 to fp32 | `vcvt {part=EVEN/ODD}` | `pto.vmi.vcvt` |
-| Narrow fp32 to bf16/f16 | `vcvt {rnd, sat, part}` | `pto.vmi.vcvt` |
-| Multiply / add / subtract | `vmul` / `vadd` / `vsub` + concrete mask | `pto.vmi.vmul` / `vadd` / `vsub` |
-| Split adjacent pairs | `vdintlv` | `pto.vmi.vdintlv` |
-| Merge even/odd streams | `vintlv` | `pto.vmi.vintlv` |
-| Store active lanes | `vsts NORM_*` or `PK_B32` + mask | `pto.vmi.vstore` |
+| Load a logical vector | `pto.mi.vlds NORM` or `pto.mi.vlds UNPK_B16` | `pto.vmi.vload` |
+| Widen bf16/f16 to fp32 | `pto.mi.vcvt {part=EVEN/ODD}` | `pto.vmi.vcvt` |
+| Narrow fp32 to bf16/f16 | `pto.mi.vcvt {rnd, sat, part}` | `pto.vmi.vcvt` |
+| Multiply / add / subtract | `pto.mi.vmul` / `pto.mi.vadd` / `pto.mi.vsub` + concrete mask | `pto.vmi.vmul` / `vadd` / `vsub` |
+| Split adjacent pairs | `pto.mi.vdintlv` | `pto.vmi.vdintlv` |
+| Merge even/odd streams | `pto.mi.vintlv` | `pto.vmi.vintlv` |
+| Store active lanes | `pto.mi.vsts NORM_*` or `PK_B32` + mask | `pto.vmi.vstore` |
 
 ### Expected Lowering Shapes
 
@@ -140,8 +140,8 @@ These are review expectations for the examples, not formal lowering rules.
 Expected MI/CCE shape:
 
 ```mlir
-%x16_phys = pto.vlds %x_ub[%off], %mask16 {dist = "UNPK_B16"} : ...
-%x32 = pto.vcvt %x16_phys, %mask16 {part = "EVEN"} : ... -> !pto.vreg<64xf32>
+%x16_phys = pto.mi.vlds %x_ub[%off], %mask16 {dist = "UNPK_B16"} : ...
+%x32 = pto.mi.vcvt %x16_phys, %mask16 {part = "EVEN"} : ... -> !pto.mi.vreg<64xf32>
 ```
 
 `PART_EVEN` is a correctness requirement because `UNPK_B16` places dense bf16
@@ -157,8 +157,8 @@ pto.vmi.vstore %y16, %y_ub[%off], %mask : ...
 Expected MI/CCE shape:
 
 ```mlir
-%y16_phys = pto.vcvt %y32, %mask32 {part = "EVEN", rnd = "R", sat = "SAT"} : ...
-pto.vsts %y16_phys, %y_ub[%off], %mask32 {dist = "PK_B32"} : ...
+%y16_phys = pto.mi.vcvt %y32, %mask32 {part = "EVEN", rnd = "R", sat = "SAT"} : ...
+pto.mi.vsts %y16_phys, %y_ub[%off], %mask32 {dist = "PK_B32"} : ...
 ```
 
 `vcvt` preserves logical lane order; `PK_B32` repairs the physical even-lane
@@ -175,9 +175,9 @@ layout before the values are written densely to UB.
 Expected MI/CCE shape:
 
 ```mlir
-%even, %odd = pto.vdintlv %x, %x : ...
-%neg_odd = pto.vmul %odd, %minus_one, %mask : ...
-%rot, %rot_hi = pto.vintlv %neg_odd, %even : ...
+%even, %odd = pto.mi.vdintlv %x, %x : ...
+%neg_odd = pto.mi.vmul %odd, %minus_one, %mask : ...
+%rot, %rot_hi = pto.mi.vintlv %neg_odd, %even : ...
 ```
 
 Argument order matters: `merge(neg_odd, even)` builds
@@ -333,8 +333,8 @@ VMI names these as `vdintlv` and `vintlv`.
 
 MI RoPE often carries both:
 
-- `!pto.mask<b16>` for b16 load/convert/f16 arithmetic
-- `!pto.mask<b32>` for fp32 arithmetic and bf16 narrow/store paths
+- `!pto.mi.mask<b16>` for b16 load/convert/f16 arithmetic
+- `!pto.mi.mask<b32>` for fp32 arithmetic and bf16 narrow/store paths
 
 Using the wrong mask family is a wrong-lane bug. VMI uses a logical
 `!pto.vmi.mask<N×pred>` and lets lowering choose the concrete predicate family.

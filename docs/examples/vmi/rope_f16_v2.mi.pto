@@ -141,7 +141,7 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
               %lt_vl128 = arith.cmpi slt, %rem_i32, %c128_i32 : i32
               %cnt_i32 = arith.select %lt_vl128, %rem_i32, %c128_i32 : i32
               // rope_f16.mi.pto: pge_b16 "PAT_VL32" (static). v2(code here): plt_b16 (CCE make_mask_b16).
-              %mask16, %mask16_next = pto.plt_b16 %cnt_i32 : i32 -> !pto.mask<b16>, i32
+              %mask16, %mask16_next = pto.mi.plt_b16 %cnt_i32 : i32 -> !pto.mi.mask<b16>, i32
 
               %cos_lo_off = arith.addi %cs_off, %elem_off : index
               %cos_hi_base = arith.addi %cs_off, %half_d_aligned : index
@@ -155,13 +155,13 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
               // %mask16 on the later arithmetic/store ops. These four table loads
               // are hoisted outside the head loop because cos/sin depend on s and d,
               // not on n. VMI equivalent: four pto.vmi.load ops on logical vectors.
-              %cos_lo = pto.vlds %cos_ub[%cos_lo_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+              %cos_lo = pto.mi.vlds %cos_ub[%cos_lo_off] : !pto.ptr<f16, ub> -> !pto.mi.vreg<128xf16>
               // High-half cosine starts at half_d_aligned, matching CCE calign(halfD, 16).
-              %cos_hi = pto.vlds %cos_ub[%cos_hi_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+              %cos_hi = pto.mi.vlds %cos_ub[%cos_hi_off] : !pto.ptr<f16, ub> -> !pto.mi.vreg<128xf16>
               // Low-half sine partners x_hi in y_lo = cos_lo*x_lo - sin_lo*x_hi.
-              %sin_lo = pto.vlds %sin_ub[%sin_lo_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+              %sin_lo = pto.mi.vlds %sin_ub[%sin_lo_off] : !pto.ptr<f16, ub> -> !pto.mi.vreg<128xf16>
               // High-half sine partners x_lo in y_hi = cos_hi*x_hi + sin_hi*x_lo.
-              %sin_hi = pto.vlds %sin_ub[%sin_hi_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+              %sin_hi = pto.mi.vlds %sin_ub[%sin_hi_off] : !pto.ptr<f16, ub> -> !pto.mi.vreg<128xf16>
 
               scf.for %n = %c0 to %n_count step %c1 {
                 %x_n_off = arith.muli %n, %x_n_step : index
@@ -177,30 +177,30 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
 
                 // Per-head input loads: x_lo is x[s,n,d], x_hi is x[s,n,d+halfD].
                 // Both are dense f16 loads; only %mask16 determines how many lanes are valid.
-                %x_lo = pto.vlds %x_ub[%x_lo_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
-                %x_hi = pto.vlds %x_ub[%x_hi_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+                %x_lo = pto.mi.vlds %x_ub[%x_lo_off] : !pto.ptr<f16, ub> -> !pto.mi.vreg<128xf16>
+                %x_hi = pto.mi.vlds %x_ub[%x_hi_off] : !pto.ptr<f16, ub> -> !pto.mi.vreg<128xf16>
 
                 // RoPE half math is the same 6-op sequence in both files;
                 // only the mask source and UB offsets differ (see comments above).
-                // t0 = cos_lo * x_lo. pto.vmul is element-wise f16 multiply and
+                // t0 = cos_lo * x_lo. pto.mi.vmul is element-wise f16 multiply and
                 // requires a b16 predicate even when the mask is the same for all math ops.
-                %t0 = pto.vmul %cos_lo, %x_lo, %mask16 : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+                %t0 = pto.mi.vmul %cos_lo, %x_lo, %mask16 : !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xf16>
                 // t1 = sin_lo * x_hi, the cross term subtracted from the low output half.
-                %t1 = pto.vmul %sin_lo, %x_hi, %mask16 : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+                %t1 = pto.mi.vmul %sin_lo, %x_hi, %mask16 : !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xf16>
                 // y_lo = t0 - t1 = x_lo*cos_lo - x_hi*sin_lo.
-                %y_lo = pto.vsub %t0, %t1, %mask16 : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+                %y_lo = pto.mi.vsub %t0, %t1, %mask16 : !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xf16>
 
                 // t2 = cos_hi * x_hi, the direct high-half term.
-                %t2 = pto.vmul %cos_hi, %x_hi, %mask16 : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+                %t2 = pto.mi.vmul %cos_hi, %x_hi, %mask16 : !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xf16>
                 // t3 = sin_hi * x_lo, the cross term added into the high output half.
-                %t3 = pto.vmul %sin_hi, %x_lo, %mask16 : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+                %t3 = pto.mi.vmul %sin_hi, %x_lo, %mask16 : !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xf16>
                 // y_hi = t2 + t3 = x_hi*cos_hi + x_lo*sin_hi.
-                %y_hi = pto.vadd %t2, %t3, %mask16 : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+                %y_hi = pto.mi.vadd %t2, %t3, %mask16 : !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xf16>
 
                 // Store low and high partner halves back to dense UB. There is no PK mode
                 // in native f16 half mode; the same b16 predicate gates active lanes.
-                pto.vsts %y_lo, %y_ub[%y_lo_off], %mask16 : !pto.vreg<128xf16>, !pto.ptr<f16, ub>, !pto.mask<b16>
-                pto.vsts %y_hi, %y_ub[%y_hi_off], %mask16 : !pto.vreg<128xf16>, !pto.ptr<f16, ub>, !pto.mask<b16>
+                pto.mi.vsts %y_lo, %y_ub[%y_lo_off], %mask16 : !pto.mi.vreg<128xf16>, !pto.ptr<f16, ub>, !pto.mi.mask<b16>
+                pto.mi.vsts %y_hi, %y_ub[%y_hi_off], %mask16 : !pto.mi.vreg<128xf16>, !pto.ptr<f16, ub>, !pto.mi.mask<b16>
               }
             }
           }
@@ -221,7 +221,7 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
           //   cos/sin dense load (no vdintlv on tables)
           //   Build i*x on x only: vdintlv(x) → vmul(odd,-1) → vintlv
           //   3 arith ops → single vsts; blk loop (64 f16/block); plt_b16; vbr(-1)
-          %neg_one = pto.vbr %neg_one_f16 : f16 -> !pto.vreg<128xf16>
+          %neg_one = pto.mi.vbr %neg_one_f16 : f16 -> !pto.mi.vreg<128xf16>
 
           scf.for %s = %c0 to %s_count step %c1 {
             %x_s_off = arith.muli %s, %x_s_step : index
@@ -239,17 +239,17 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
               %pair_cnt_i32 = arith.divui %pair_cnt_plus, %c2_i32 : i32
 
               // Full-block predicate: active f16 lanes for dense x/cos/sin/y operations.
-              %mask16, %mask16_next = pto.plt_b16 %cnt_i32 : i32 -> !pto.mask<b16>, i32
+              %mask16, %mask16_next = pto.mi.plt_b16 %cnt_i32 : i32 -> !pto.mi.mask<b16>, i32
               // Pair predicate: active even/odd pair lanes after vdintlv. It has half
               // the logical length because one lane in each split stream represents one pair.
-              %mask_pair, %mask_pair_next = pto.plt_b16 %pair_cnt_i32 : i32 -> !pto.mask<b16>, i32
+              %mask_pair, %mask_pair_next = pto.mi.plt_b16 %pair_cnt_i32 : i32 -> !pto.mi.mask<b16>, i32
 
               %cs_elem_off = arith.addi %cs_off, %off : index
               // rope_f16.mi.pto deinterleaves cos/sin here; v2 keeps tables dense.
               // Dense cos/sin loads. In the complex-multiply spelling the tables are
               // not deinterleaved; the rotated x vector is built instead.
-              %cos = pto.vlds %cos_ub[%cs_elem_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
-              %sin = pto.vlds %sin_ub[%cs_elem_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+              %cos = pto.mi.vlds %cos_ub[%cs_elem_off] : !pto.ptr<f16, ub> -> !pto.mi.vreg<128xf16>
+              %sin = pto.mi.vlds %sin_ub[%cs_elem_off] : !pto.ptr<f16, ub> -> !pto.mi.vreg<128xf16>
 
               scf.for %n = %c0 to %n_count step %c1 {
                 %x_n_off = arith.muli %n, %x_n_step : index
@@ -260,31 +260,31 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
                 %y_elem_off = arith.addi %y_off, %off : index
 
                 // Dense interleaved input: [x0,x1,x2,x3,...]. vdintlv below splits parity.
-                %x = pto.vlds %x_ub[%x_elem_off] : !pto.ptr<f16, ub> -> !pto.vreg<128xf16>
+                %x = pto.mi.vlds %x_ub[%x_elem_off] : !pto.ptr<f16, ub> -> !pto.mi.vreg<128xf16>
 
                 // Build (i*x) for complex-multiply form — v1 builds i*x implicitly
                 // via separate y_even/y_odd updates on deinterleaved streams.
                 // vdintlv(x,x): even=[x0,x2,...], odd=[x1,x3,...]. This is the
                 // hardware equivalent of VMI channel_split.
-                %x_even, %x_odd = pto.vdintlv %x, %x : !pto.vreg<128xf16>, !pto.vreg<128xf16> -> !pto.vreg<128xf16>, !pto.vreg<128xf16>
+                %x_even, %x_odd = pto.mi.vdintlv %x, %x : !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16> -> !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16>
                 // Negate odd stream to form the real-layout action of multiplying by i.
-                %x_neg_odd = pto.vmul %x_odd, %neg_one, %mask_pair : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+                %x_neg_odd = pto.mi.vmul %x_odd, %neg_one, %mask_pair : !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xf16>
                 // vintlv(-odd, even): rebuild [-x1,x0,-x3,x2,...]. x_rot_hi is
                 // produced by the hardware interleave but unused for this 64-element block.
-                %x_rot, %x_rot_hi = pto.vintlv %x_neg_odd, %x_even : !pto.vreg<128xf16>, !pto.vreg<128xf16> -> !pto.vreg<128xf16>, !pto.vreg<128xf16>
+                %x_rot, %x_rot_hi = pto.mi.vintlv %x_neg_odd, %x_even : !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16> -> !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16>
 
                 // complex-multiply: y = x*cos + (i*x)*sin  (3 ops)
                 // vs Cartesian expansion: separate y_even/y_odd updates (8 ops)
                 // First product term: x*cos, preserving the dense interleaved order.
-                %x_cos = pto.vmul %x, %cos, %mask16 : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+                %x_cos = pto.mi.vmul %x, %cos, %mask16 : !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xf16>
                 // Second product term: (i*x)*sin using the rotated partner vector.
-                %rot_sin = pto.vmul %x_rot, %sin, %mask16 : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+                %rot_sin = pto.mi.vmul %x_rot, %sin, %mask16 : !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xf16>
                 // Add the two dense terms: y = x*cos + (i*x)*sin.
-                %y = pto.vadd %x_cos, %rot_sin, %mask16 : !pto.vreg<128xf16>, !pto.vreg<128xf16>, !pto.mask<b16> -> !pto.vreg<128xf16>
+                %y = pto.mi.vadd %x_cos, %rot_sin, %mask16 : !pto.mi.vreg<128xf16>, !pto.mi.vreg<128xf16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xf16>
 
                 // Store dense interleaved f16 output. The mask covers the original
                 // dense block, not the half-width pair streams used while building x_rot.
-                pto.vsts %y, %y_ub[%y_elem_off], %mask16 : !pto.vreg<128xf16>, !pto.ptr<f16, ub>, !pto.mask<b16>
+                pto.mi.vsts %y, %y_ub[%y_elem_off], %mask16 : !pto.mi.vreg<128xf16>, !pto.ptr<f16, ub>, !pto.mi.mask<b16>
               }
             }
           }

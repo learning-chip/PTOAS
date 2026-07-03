@@ -64,14 +64,14 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
         //   all-zero blocks produce zero scale and zero reciprocal; invalid/subnormal
         //   reciprocal cases are replaced with specialExp.
         // Instruction reading guide for this MI file:
-        // - pto.vldsx2 "DINTLV_B16" is the first physical split: a 256-element
+        // - pto.mi.vldsx2 "DINTLV_B16" is the first physical split: a 256-element
         //   bf16 row cannot fit in one 256-byte register, so even logical indices
         //   go to x0Bf16 and odd logical indices go to x1Bf16.
-        // - pto.vbitcast reinterprets bf16 bits as i16 without changing lanes;
-        //   pto.vand with 0x7F80 extracts the bf16 exponent field.
-        // - pto.vmax and pto.vcgmax implement running max and cross-lane max, but
+        // - pto.mi.vbitcast reinterprets bf16 bits as i16 without changing lanes;
+        //   pto.mi.vand with 0x7F80 extracts the bf16 exponent field.
+        // - pto.mi.vmax and pto.mi.vcgmax implement running max and cross-lane max, but
         //   each operation still names a concrete b16 predicate.
-        // - pto.vpack "LOWER", pto.vselr, and pto.vsts NORM_B8/NORM_B16 are
+        // - pto.mi.vpack "LOWER", pto.mi.vselr, and pto.mi.vsts NORM_B8/NORM_B16 are
         //   storage/layout instructions for scale bytes and reciprocal halfwords.
         // VMI equivalents collapse the even/odd ownership into one logical
         // vreg<256x...>, use group_reduce_maxi/group_broadcast for the reduction,
@@ -82,69 +82,69 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
 
         // All 128 b16 lanes active: used by exponent bit ops, comparisons,
         // selects, subtracts, shifts, and the cross-lane max.
-        %pregAllB16 = pto.pset_b16 "PAT_ALL" : !pto.mask<b16>
+        %pregAllB16 = pto.mi.pset_b16 "PAT_ALL" : !pto.mi.mask<b16>
         // All 256 b8 lanes active: used when writing the full scale2 byte vector.
-        %pregAllB8 = pto.pset_b8 "PAT_ALL" : !pto.mask<b8>
+        %pregAllB8 = pto.mi.pset_b8 "PAT_ALL" : !pto.mi.mask<b8>
         // First 8 b8 lanes active: scale1 has only 8 meaningful bytes per row.
-        %pregReduceB8 = pto.pge_b8 "PAT_VL8" : !pto.mask<b8>
+        %pregReduceB8 = pto.mi.pge_b8 "PAT_VL8" : !pto.mi.mask<b8>
         // First 16 b16 lanes active: reciprocal store writes the compact halfword set.
-        %pregReduceB16 = pto.pge_b16 "PAT_VL16" : !pto.mask<b16>
+        %pregReduceB16 = pto.mi.pge_b16 "PAT_VL16" : !pto.mi.mask<b16>
 
         // 0x7F80 broadcast: bf16 exponent mask, preserving bits [14:7].
-        %expMaskBF16 = pto.vbr %c32640_i16 : i16 -> !pto.vreg<128xi16>
+        %expMaskBF16 = pto.mi.vbr %c32640_i16 : i16 -> !pto.mi.vreg<128xi16>
         // MI: vbr 广播标量到 128-wide——因 DINTLV 拆分, 所有常量仅 128 宽。
         // 对比 VMI: vmi.broadcast 广播到 256-wide, 与数据宽度一致。
 
         // Running max accumulator for even-index DINTLV half, initialized to exponent 0.
-        %expMax1Dim2Init = pto.vbr %c0_i16 : i16 -> !pto.vreg<128xi16>
+        %expMax1Dim2Init = pto.mi.vbr %c0_i16 : i16 -> !pto.mi.vreg<128xi16>
         // Running max accumulator for odd-index DINTLV half, initialized to exponent 0.
-        %expMax2Dim2Init = pto.vbr %c0_i16 : i16 -> !pto.vreg<128xi16>
+        %expMax2Dim2Init = pto.mi.vbr %c0_i16 : i16 -> !pto.mi.vreg<128xi16>
         // Target output maximum exponent in bf16 exponent-field position.
-        %yMaxExpReg = pto.vbr %yMaxExp : i16 -> !pto.vreg<128xi16>
+        %yMaxExpReg = pto.mi.vbr %yMaxExp : i16 -> !pto.mi.vreg<128xi16>
         // E8M0 NaN byte value 0xFF, held in i16 lanes until vpack LOWER.
-        %nanE8M0 = pto.vbr %c255_i16 : i16 -> !pto.vreg<128xi16>
+        %nanE8M0 = pto.mi.vbr %c255_i16 : i16 -> !pto.mi.vreg<128xi16>
         // bf16 bias 127 encoded as exponent field 0x7F00.
-        %biasE8M0 = pto.vbr %c32512_i16 : i16 -> !pto.vreg<128xi16>
+        %biasE8M0 = pto.mi.vbr %c32512_i16 : i16 -> !pto.mi.vreg<128xi16>
         // All-zero vector used for zero-block comparisons and selections.
-        %zero = pto.vbr %c0_i16 : i16 -> !pto.vreg<128xi16>
+        %zero = pto.mi.vbr %c0_i16 : i16 -> !pto.mi.vreg<128xi16>
         // Custom bf16 NaN pattern used for reciprocal output on Inf/NaN blocks.
-        %nanBF16 = pto.vbr %c32641_i16 : i16 -> !pto.vreg<128xi16>
+        %nanBF16 = pto.mi.vbr %c32641_i16 : i16 -> !pto.mi.vreg<128xi16>
         // Special reciprocal threshold for invalid/subnormal reciprocal cases.
-        %specialExp = pto.vbr %c64_i16 : i16 -> !pto.vreg<128xi16>
+        %specialExp = pto.mi.vbr %c64_i16 : i16 -> !pto.mi.vreg<128xi16>
 
         %expMax1Dim2, %expMax2Dim2 = scf.for %i = %c0 to %row_count step %c1
             iter_args(%acc0 = %expMax1Dim2Init, %acc1 = %expMax2Dim2Init)
-            -> (!pto.vreg<128xi16>, !pto.vreg<128xi16>) {
+            -> (!pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>) {
           %loadOffset = arith.muli %i, %load_stride : index
           // MI: vldsx2 + DINTLV_B16 交错加载一行 bf16 -> x0(偶数索引), x1(奇数索引) 两路 128。
           // 对比 VMI: vmi.load 加载 256-wide 逻辑连续向量。
 
-          %x0Bf16, %x1Bf16 = pto.vldsx2 %xBf[%loadOffset], "DINTLV_B16"
-            : !pto.ptr<bf16, ub>, index -> !pto.vreg<128xbf16>, !pto.vreg<128xbf16>
+          %x0Bf16, %x1Bf16 = pto.mi.vldsx2 %xBf[%loadOffset], "DINTLV_B16"
+            : !pto.ptr<bf16, ub>, index -> !pto.mi.vreg<128xbf16>, !pto.mi.vreg<128xbf16>
           // MI: vbitcast bf16->i16 重解释, 然后 vand 提取指数位 (bf16 指数在位[14:7])。
           // vand 需绑定 mask<b16>, 即使是对所有元素操作。
           // 对比 VMI: vmi.bitcast + vmi.andi (无 mask)。
 
           // Reinterpret even-index bf16 values as i16 bit patterns; no numeric conversion.
-          %x0Bits = pto.vbitcast %x0Bf16 : !pto.vreg<128xbf16> -> !pto.vreg<128xi16>
+          %x0Bits = pto.mi.vbitcast %x0Bf16 : !pto.mi.vreg<128xbf16> -> !pto.mi.vreg<128xi16>
           // Reinterpret odd-index bf16 values as i16 bit patterns.
-          %x1Bits = pto.vbitcast %x1Bf16 : !pto.vreg<128xbf16> -> !pto.vreg<128xi16>
+          %x1Bits = pto.mi.vbitcast %x1Bf16 : !pto.mi.vreg<128xbf16> -> !pto.mi.vreg<128xi16>
           // Extract bf16 exponent field from even-index half: x0Bits & 0x7F80.
-          %x0ExpBF16 = pto.vand %x0Bits, %expMaskBF16, %pregAllB16
-            : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
+          %x0ExpBF16 = pto.mi.vand %x0Bits, %expMaskBF16, %pregAllB16
+            : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
           // Extract bf16 exponent field from odd-index half: x1Bits & 0x7F80.
-          %x1ExpBF16 = pto.vand %x1Bits, %expMaskBF16, %pregAllB16
-            : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
+          %x1ExpBF16 = pto.mi.vand %x1Bits, %expMaskBF16, %pregAllB16
+            : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
           // MI: vmax 逐元素取 max——需绑定 mask<b16>。x0/x1 两路分别归约。
           // 对比 VMI: cmpi + select 组合 (无 mask), 单路归约。
 
           // Update running max for even-index lanes across rows.
-          %nextAcc0 = pto.vmax %acc0, %x0ExpBF16, %pregAllB16
-            : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
+          %nextAcc0 = pto.mi.vmax %acc0, %x0ExpBF16, %pregAllB16
+            : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
           // Update running max for odd-index lanes across rows.
-          %nextAcc1 = pto.vmax %acc1, %x1ExpBF16, %pregAllB16
-            : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
-          scf.yield %nextAcc0, %nextAcc1 : !pto.vreg<128xi16>, !pto.vreg<128xi16>
+          %nextAcc1 = pto.mi.vmax %acc1, %x1ExpBF16, %pregAllB16
+            : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
+          scf.yield %nextAcc0, %nextAcc1 : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>
         }
 
         // ========================================================================
@@ -154,11 +154,11 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
         // ========================================================================
 
         // Merge the even/odd DINTLV accumulators element-wise before global reduction.
-        %expMaxDimPre = pto.vmax %expMax1Dim2, %expMax2Dim2, %pregAllB16
-          : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
+        %expMaxDimPre = pto.mi.vmax %expMax1Dim2, %expMax2Dim2, %pregAllB16
+          : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
         // Cross-lane max and broadcast: every lane receives the block max exponent.
-        %expMaxDim0 = pto.vcgmax %expMaxDimPre, %pregAllB16
-          : !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
+        %expMaxDim0 = pto.mi.vcgmax %expMaxDimPre, %pregAllB16
+          : !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
 
         // ========================================================================
         // 阶段3: scale 计算 - vcmp 比较 + vsel 选择 + vsub 减法 + vshrs 移位
@@ -167,55 +167,55 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
         // ========================================================================
 
         // Predicate is true for non-Inf/NaN blocks because vcmp mode is "ne".
-        %infMask = pto.vcmp %expMaxDim0, %expMaskBF16, %pregAllB16, "ne"
-          : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.mask<b16>
+        %infMask = pto.mi.vcmp %expMaxDim0, %expMaskBF16, %pregAllB16, "ne"
+          : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.mask<b16>
         // Predicate is true for non-zero blocks because vcmp mode is "ne".
-        %zeroMask = pto.vcmp %expMaxDim0, %zero, %pregAllB16, "ne"
-          : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.mask<b16>
+        %zeroMask = pto.mi.vcmp %expMaxDim0, %zero, %pregAllB16, "ne"
+          : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.mask<b16>
         // Predicate marks expMax <= yMaxExp, i.e. values too small for normal scale.
-        %invalidDataMask = pto.vcmp %expMaxDim0, %yMaxExpReg, %pregAllB16, "le"
-          : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.mask<b16>
+        %invalidDataMask = pto.mi.vcmp %expMaxDim0, %yMaxExpReg, %pregAllB16, "le"
+          : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.mask<b16>
         // Clamp low/invalid exponent blocks up to yMaxExp before subtracting.
-        %expMaxDim1 = pto.vsel %yMaxExpReg, %expMaxDim0, %invalidDataMask
-          : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
+        %expMaxDim1 = pto.mi.vsel %yMaxExpReg, %expMaxDim0, %invalidDataMask
+          : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
         // Compute exponent delta in bf16 exponent-field units: expMax - yMaxExp.
-        %expMaxDim2 = pto.vsub %expMaxDim1, %yMaxExpReg, %pregAllB16
-          : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
+        %expMaxDim2 = pto.mi.vsub %expMaxDim1, %yMaxExpReg, %pregAllB16
+          : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
         // Shift right by 7 to convert bf16 exponent-field placement into E8M0 byte value.
-        %mxScaleB16_0 = pto.vshrs %expMaxDim2, %c7_i16, %pregAllB16
-          : !pto.vreg<128xi16>, i16, !pto.mask<b16> -> !pto.vreg<128xi16>
+        %mxScaleB16_0 = pto.mi.vshrs %expMaxDim2, %c7_i16, %pregAllB16
+          : !pto.mi.vreg<128xi16>, i16, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
         // For Inf/NaN blocks, select 0xFF; otherwise keep computed scale.
-        %mxScaleB16_1 = pto.vsel %mxScaleB16_0, %nanE8M0, %infMask
-          : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
+        %mxScaleB16_1 = pto.mi.vsel %mxScaleB16_0, %nanE8M0, %infMask
+          : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
         // For zero blocks, select 0; otherwise keep the previous scale result.
-        %mxScaleB16_2 = pto.vsel %mxScaleB16_1, %zero, %zeroMask
-          : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
+        %mxScaleB16_2 = pto.mi.vsel %mxScaleB16_1, %zero, %zeroMask
+          : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
         // MI: vpack LOWER 将 bf16 的低字节提取为 scale1 字节。需指定 LOWER 半区。
         // 对比 VMI: vmi.trunci i32->ui8 语义截断。
 
         // Pack low bytes of i16 scale lanes into a uint8 vector for scale1/scale2 storage.
-        %mxScale1B8 = pto.vpack %mxScaleB16_2, "LOWER"
-          : !pto.vreg<128xi16> -> !pto.vreg<256xui8>
+        %mxScale1B8 = pto.mi.vpack %mxScaleB16_2, "LOWER"
+          : !pto.mi.vreg<128xi16> -> !pto.mi.vreg<256xui8>
 
         scf.for %i = %c0 to %row_count step %c1 {
           %scaleOff = arith.muli %i, %ub_block : index
           // Store the compact scale1 bytes for this row; only first 8 b8 lanes are meaningful.
-          pto.vsts %mxScale1B8, %mxScale1Addr[%scaleOff], %pregReduceB8 {dist = "NORM_B8"}
-            : !pto.vreg<256xui8>, !pto.ptr<ui8, ub>, !pto.mask<b8>
+          pto.mi.vsts %mxScale1B8, %mxScale1Addr[%scaleOff], %pregReduceB8 {dist = "NORM_B8"}
+            : !pto.mi.vreg<256xui8>, !pto.ptr<ui8, ub>, !pto.mi.mask<b8>
         }
 
         // MI: vlds 加载 gatherIndex, 然后 vselr 按索引从 mxScale1 选取 scale2 字节。
         // 对比 VMI: 归约广播后所有 lane 值相同, 直接 store scale1Full 即可。
 
         // Load gather indices that describe the scale2 interleaved output layout.
-        %gatherIndex = pto.vlds %gatherIndexAddr[%c0] {dist = "NORM"}
-          : !pto.ptr<ui8, ub> -> !pto.vreg<256xui8>
+        %gatherIndex = pto.mi.vlds %gatherIndexAddr[%c0] {dist = "NORM"}
+          : !pto.ptr<ui8, ub> -> !pto.mi.vreg<256xui8>
         // Gather selected scale1 bytes into the scale2 row layout.
-        %mxScale2B8 = pto.vselr %mxScale1B8, %gatherIndex
-          : !pto.vreg<256xui8>, !pto.vreg<256xui8> -> !pto.vreg<256xui8>
+        %mxScale2B8 = pto.mi.vselr %mxScale1B8, %gatherIndex
+          : !pto.mi.vreg<256xui8>, !pto.mi.vreg<256xui8> -> !pto.mi.vreg<256xui8>
         // Store full scale2 byte vector.
-        pto.vsts %mxScale2B8, %mxScale2Addr[%c0], %pregAllB8 {dist = "NORM_B8"}
-          : !pto.vreg<256xui8>, !pto.ptr<ui8, ub>, !pto.mask<b8>
+        pto.mi.vsts %mxScale2B8, %mxScale2Addr[%c0], %pregAllB8 {dist = "NORM_B8"}
+          : !pto.mi.vreg<256xui8>, !pto.ptr<ui8, ub>, !pto.mi.mask<b8>
 
         // ========================================================================
         // 阶段4: reciprocal scale - vsub + vsel 链, 每条带 mask<b16> + vbitcast i16->ui16
@@ -223,28 +223,28 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
         // ========================================================================
 
         // Detect reciprocal edge case where exponent delta equals the bf16 bias field.
-        %invalidRecipMask = pto.vcmp %expMaxDim2, %biasE8M0, %pregAllB16, "eq"
-          : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.mask<b16>
+        %invalidRecipMask = pto.mi.vcmp %expMaxDim2, %biasE8M0, %pregAllB16, "eq"
+          : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.mask<b16>
         // Reciprocal exponent field: bias - exponent_delta.
-        %reversedShareExp0 = pto.vsub %biasE8M0, %expMaxDim2, %pregAllB16
-          : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
+        %reversedShareExp0 = pto.mi.vsub %biasE8M0, %expMaxDim2, %pregAllB16
+          : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
         // Inf/NaN blocks receive custom bf16 NaN reciprocal; others keep computed reciprocal.
-        %reversedShareExp1 = pto.vsel %reversedShareExp0, %nanBF16, %infMask
-          : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
+        %reversedShareExp1 = pto.mi.vsel %reversedShareExp0, %nanBF16, %infMask
+          : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
         // Zero blocks receive reciprocal 0.
-        %reversedShareExp2 = pto.vsel %reversedShareExp1, %zero, %zeroMask
-          : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
+        %reversedShareExp2 = pto.mi.vsel %reversedShareExp1, %zero, %zeroMask
+          : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
         // Invalid reciprocal edge receives the special exponent threshold.
-        %reversedShareExp3 = pto.vsel %specialExp, %reversedShareExp2, %invalidRecipMask
-          : !pto.vreg<128xi16>, !pto.vreg<128xi16>, !pto.mask<b16> -> !pto.vreg<128xi16>
+        %reversedShareExp3 = pto.mi.vsel %specialExp, %reversedShareExp2, %invalidRecipMask
+          : !pto.mi.vreg<128xi16>, !pto.mi.vreg<128xi16>, !pto.mi.mask<b16> -> !pto.mi.vreg<128xi16>
         // Reinterpret signed exponent-field lanes as unsigned halfwords for UB storage.
-        %reversedShareExpU16 = pto.vbitcast %reversedShareExp3 : !pto.vreg<128xi16> -> !pto.vreg<128xui16>
+        %reversedShareExpU16 = pto.mi.vbitcast %reversedShareExp3 : !pto.mi.vreg<128xi16> -> !pto.mi.vreg<128xui16>
         // MI: vsts + NORM_B16 按 halfword 写入, 绑定 mask<b16> (reduce 模式, 16个half/行)。
         // 对比 VMI: vmi.store。
 
         // Store compact reciprocal halfwords; only the reduce-width b16 lanes are written.
-        pto.vsts %reversedShareExpU16, %mxScaleReciprocalAddr[%c0], %pregReduceB16 {dist = "NORM_B16"}
-          : !pto.vreg<128xui16>, !pto.ptr<ui16, ub>, !pto.mask<b16>
+        pto.mi.vsts %reversedShareExpU16, %mxScaleReciprocalAddr[%c0], %pregReduceB16 {dist = "NORM_B16"}
+          : !pto.mi.vreg<128xui16>, !pto.ptr<ui16, ub>, !pto.mi.mask<b16>
       }
 
       return

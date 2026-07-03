@@ -94,11 +94,11 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
         // x_ub/cos_ub/sin_ub are read-only from the vector compute perspective.
         // Instruction reading guide for this MI file:
         // - f32 is the simplest physical case: one 256-byte vector register holds
-        //   64 f32 lanes, so loads/stores are plain pto.vlds/pto.vsts with no
+        //   64 f32 lanes, so loads/stores are plain pto.mi.vlds/pto.mi.vsts with no
         //   UNPK/PK distribution mode.
         // - The low-level burden that remains is predicate plumbing: pge_b32 or
         //   pset_b32 must be passed to every vmul/vsub/vadd/vsts instruction.
-        // - In INTERLEAVE mode, pto.vdintlv and pto.vintlv are still required to
+        // - In INTERLEAVE mode, pto.mi.vdintlv and pto.mi.vintlv are still required to
         //   split [even,odd] pair channels and merge them back.
         // VMI equivalents keep the same math but replace the shuffle vocabulary
         // with channel_split/channel_merge and remove arithmetic mask operands.
@@ -109,7 +109,7 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
           // VMI 对应: vmi.create_mask（逻辑长度创建，统一 vmi.mask<N>）。
 
           // pge_b32 PAT_VL32 activates the first 32 f32 lanes for one D/2 half.
-          %mask32_half = pto.pge_b32 "PAT_VL32" : !pto.mask<b32>
+          %mask32_half = pto.mi.pge_b32 "PAT_VL32" : !pto.mi.mask<b32>
           scf.for %s = %c0 to %s_count step %c1 {
             %x_s_off = arith.muli %s, %x_s_step : index
             %cs_off = arith.muli %s, %cs_s_step : index
@@ -121,13 +121,13 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
             // VMI 对应: vmi.load（统一的逻辑向量接口）。
 
             // Load low-half cosine table for y_lo = cos_lo*x_lo - sin_lo*x_hi.
-            %cos_lo = pto.vlds %cos_ub[%cs_off] : !pto.ptr<f32, ub> -> !pto.vreg<64xf32>
+            %cos_lo = pto.mi.vlds %cos_ub[%cs_off] : !pto.ptr<f32, ub> -> !pto.mi.vreg<64xf32>
             // Load high-half cosine table from the D/2 offset.
-            %cos_hi = pto.vlds %cos_ub[%cs_hi_off] : !pto.ptr<f32, ub> -> !pto.vreg<64xf32>
+            %cos_hi = pto.mi.vlds %cos_ub[%cs_hi_off] : !pto.ptr<f32, ub> -> !pto.mi.vreg<64xf32>
             // Load low-half sine table for the low-output cross term.
-            %sin_lo = pto.vlds %sin_ub[%cs_off] : !pto.ptr<f32, ub> -> !pto.vreg<64xf32>
+            %sin_lo = pto.mi.vlds %sin_ub[%cs_off] : !pto.ptr<f32, ub> -> !pto.mi.vreg<64xf32>
             // Load high-half sine table for the high-output cross term.
-            %sin_hi = pto.vlds %sin_ub[%cs_hi_off] : !pto.ptr<f32, ub> -> !pto.vreg<64xf32>
+            %sin_hi = pto.mi.vlds %sin_ub[%cs_hi_off] : !pto.ptr<f32, ub> -> !pto.mi.vreg<64xf32>
 
             // HALF layout keeps the two partner halves separate all the way through.
             scf.for %n = %c0 to %n_count step %c1 {
@@ -139,9 +139,9 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
               %y_hi_off = arith.addi %y_off, %c32 : index
 
               // Load x low half for this (s,n) row.
-              %x_lo = pto.vlds %x_ub[%x_off] : !pto.ptr<f32, ub> -> !pto.vreg<64xf32>
+              %x_lo = pto.mi.vlds %x_ub[%x_off] : !pto.ptr<f32, ub> -> !pto.mi.vreg<64xf32>
               // Load x high half, the rotation partner of x_lo.
-              %x_hi = pto.vlds %x_ub[%x_hi_off] : !pto.ptr<f32, ub> -> !pto.vreg<64xf32>
+              %x_hi = pto.mi.vlds %x_ub[%x_hi_off] : !pto.ptr<f32, ub> -> !pto.mi.vreg<64xf32>
 
               // ========================================================================
               // Half 模式 RoPE 核心计算 — MI f32 版本
@@ -154,26 +154,26 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
               // ========================================================================
 
               // t0 = cos_lo * x_lo, the direct low-half term.
-              %t0 = pto.vmul %cos_lo, %x_lo, %mask32_half : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %t0 = pto.mi.vmul %cos_lo, %x_lo, %mask32_half : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>, !pto.mi.mask<b32> -> !pto.mi.vreg<64xf32>
               // t1 = sin_lo * x_hi, the cross term subtracted from low half.
-              %t1 = pto.vmul %sin_lo, %x_hi, %mask32_half : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %t1 = pto.mi.vmul %sin_lo, %x_hi, %mask32_half : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>, !pto.mi.mask<b32> -> !pto.mi.vreg<64xf32>
               // y_lo = cos_lo*x_lo - sin_lo*x_hi.
-              %y_lo = pto.vsub %t0, %t1, %mask32_half : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %y_lo = pto.mi.vsub %t0, %t1, %mask32_half : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>, !pto.mi.mask<b32> -> !pto.mi.vreg<64xf32>
 
               // t2 = cos_hi * x_hi, the direct high-half term.
-              %t2 = pto.vmul %cos_hi, %x_hi, %mask32_half : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %t2 = pto.mi.vmul %cos_hi, %x_hi, %mask32_half : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>, !pto.mi.mask<b32> -> !pto.mi.vreg<64xf32>
               // t3 = sin_hi * x_lo, the cross term added to high half.
-              %t3 = pto.vmul %sin_hi, %x_lo, %mask32_half : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %t3 = pto.mi.vmul %sin_hi, %x_lo, %mask32_half : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>, !pto.mi.mask<b32> -> !pto.mi.vreg<64xf32>
               // y_hi = cos_hi*x_hi + sin_hi*x_lo.
-              %y_hi = pto.vadd %t2, %t3, %mask32_half : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %y_hi = pto.mi.vadd %t2, %t3, %mask32_half : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>, !pto.mi.mask<b32> -> !pto.mi.vreg<64xf32>
 
               // MI: vsts 写回，绑定 mask<b32>。
               // VMI 对应: vmi.masked_store。
 
               // Store low output half with the same 32-lane b32 predicate.
-              pto.vsts %y_lo, %y_ub[%y_off], %mask32_half : !pto.vreg<64xf32>, !pto.ptr<f32, ub>, !pto.mask<b32>
+              pto.mi.vsts %y_lo, %y_ub[%y_off], %mask32_half : !pto.mi.vreg<64xf32>, !pto.ptr<f32, ub>, !pto.mi.mask<b32>
               // Store high output half at +D/2.
-              pto.vsts %y_hi, %y_ub[%y_hi_off], %mask32_half : !pto.vreg<64xf32>, !pto.ptr<f32, ub>, !pto.mask<b32>
+              pto.mi.vsts %y_hi, %y_ub[%y_hi_off], %mask32_half : !pto.mi.vreg<64xf32>, !pto.ptr<f32, ub>, !pto.mi.mask<b32>
             }
           }
         } else {
@@ -187,18 +187,18 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
           // ========================================================================
 
           // Pair mask: 32 even/odd pairs after deinterleave.
-          %mask32_pair = pto.pge_b32 "PAT_VL32" : !pto.mask<b32>
+          %mask32_pair = pto.mi.pge_b32 "PAT_VL32" : !pto.mi.mask<b32>
           // Full mask: all 64 f32 lanes when storing the merged interleaved row.
-          %mask32_full = pto.pset_b32 "PAT_ALL" : !pto.mask<b32>
+          %mask32_full = pto.mi.pset_b32 "PAT_ALL" : !pto.mi.mask<b32>
           scf.for %s = %c0 to %s_count step %c1 {
             %x_s_off = arith.muli %s, %x_s_step : index
             %cs_off = arith.muli %s, %cs_s_step : index
             %y_s_off = arith.muli %s, %y_s_step : index
 
             // Load dense interleaved cosine table [c0,c1,c2,c3,...].
-            %cos = pto.vlds %cos_ub[%cs_off] : !pto.ptr<f32, ub> -> !pto.vreg<64xf32>
+            %cos = pto.mi.vlds %cos_ub[%cs_off] : !pto.ptr<f32, ub> -> !pto.mi.vreg<64xf32>
             // Load dense interleaved sine table [s0,s1,s2,s3,...].
-            %sin = pto.vlds %sin_ub[%cs_off] : !pto.ptr<f32, ub> -> !pto.vreg<64xf32>
+            %sin = pto.mi.vlds %sin_ub[%cs_off] : !pto.ptr<f32, ub> -> !pto.mi.vreg<64xf32>
             // split even/odd -> form rotated partner -> y = x*cos + rot(x)*sin.
             // Here the same relation is written directly in explicit even/odd form.
             // MI: vdintlv 硬件解交织 cos/sin——拆出 even/odd 通道。
@@ -206,9 +206,9 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
             // VMI 对应: channel_split（语义化奇偶分解）。
 
             // Split cosine into even-index and odd-index streams for Cartesian RoPE.
-            %cos_even, %cos_odd = pto.vdintlv %cos, %cos : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
+            %cos_even, %cos_odd = pto.mi.vdintlv %cos, %cos : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32> -> !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>
             // Split sine into even-index and odd-index streams.
-            %sin_even, %sin_odd = pto.vdintlv %sin, %sin : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
+            %sin_even, %sin_odd = pto.mi.vdintlv %sin, %sin : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32> -> !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>
 
             scf.for %n = %c0 to %n_count step %c1 {
               %x_n_off = arith.muli %n, %x_n_step : index
@@ -217,12 +217,12 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
               %y_off = arith.addi %y_s_off, %y_n_off : index
 
               // Load dense interleaved x row [x0,x1,x2,x3,...].
-              %x = pto.vlds %x_ub[%x_off] : !pto.ptr<f32, ub> -> !pto.vreg<64xf32>
+              %x = pto.mi.vlds %x_ub[%x_off] : !pto.ptr<f32, ub> -> !pto.mi.vreg<64xf32>
               // MI: vdintlv 解交织 x。
               // VMI 对应: channel_split。
 
               // Split x into real/even and imaginary/odd streams.
-              %x_even, %x_odd = pto.vdintlv %x, %x : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
+              %x_even, %x_odd = pto.mi.vdintlv %x, %x : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32> -> !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>
 
               // Explicit even/odd RoPE equations for the interleaved layout.
               // ========================================================================
@@ -232,30 +232,30 @@ module attributes {pto.backend = "vpto", pto.target_arch = "a5"} {
               // ========================================================================
 
               // x_even_cos = x_even * cos_even.
-              %x_even_cos = pto.vmul %x_even, %cos_even, %mask32_pair : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %x_even_cos = pto.mi.vmul %x_even, %cos_even, %mask32_pair : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>, !pto.mi.mask<b32> -> !pto.mi.vreg<64xf32>
               // x_odd_sin = x_odd * sin_even.
-              %x_odd_sin = pto.vmul %x_odd, %sin_even, %mask32_pair : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %x_odd_sin = pto.mi.vmul %x_odd, %sin_even, %mask32_pair : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>, !pto.mi.mask<b32> -> !pto.mi.vreg<64xf32>
               // y_even = x_even*cos_even - x_odd*sin_even.
-              %y_even = pto.vsub %x_even_cos, %x_odd_sin, %mask32_pair : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %y_even = pto.mi.vsub %x_even_cos, %x_odd_sin, %mask32_pair : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>, !pto.mi.mask<b32> -> !pto.mi.vreg<64xf32>
 
               // x_odd_cos = x_odd * cos_odd.
-              %x_odd_cos = pto.vmul %x_odd, %cos_odd, %mask32_pair : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %x_odd_cos = pto.mi.vmul %x_odd, %cos_odd, %mask32_pair : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>, !pto.mi.mask<b32> -> !pto.mi.vreg<64xf32>
               // x_even_sin = x_even * sin_odd.
-              %x_even_sin = pto.vmul %x_even, %sin_odd, %mask32_pair : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %x_even_sin = pto.mi.vmul %x_even, %sin_odd, %mask32_pair : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>, !pto.mi.mask<b32> -> !pto.mi.vreg<64xf32>
               // y_odd = x_odd*cos_odd + x_even*sin_odd.
-              %y_odd = pto.vadd %x_odd_cos, %x_even_sin, %mask32_pair : !pto.vreg<64xf32>, !pto.vreg<64xf32>, !pto.mask<b32> -> !pto.vreg<64xf32>
+              %y_odd = pto.mi.vadd %x_odd_cos, %x_even_sin, %mask32_pair : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>, !pto.mi.mask<b32> -> !pto.mi.vreg<64xf32>
 
               // MI: vintlv 硬件交织 even/odd 回交织格式。
               // 产出 y_pack(64xf32) 和 y_pack_hi(64xf32)，只需 store y_pack。
               // VMI 对应: channel_merge（单个 vreg<128xf32>，一次 store）。
 
               // Interleave even/odd outputs back to [y0,y1,y2,y3,...].
-              %y_pack, %y_pack_hi = pto.vintlv %y_even, %y_odd : !pto.vreg<64xf32>, !pto.vreg<64xf32> -> !pto.vreg<64xf32>, !pto.vreg<64xf32>
+              %y_pack, %y_pack_hi = pto.mi.vintlv %y_even, %y_odd : !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32> -> !pto.mi.vreg<64xf32>, !pto.mi.vreg<64xf32>
               // MI: vsts 写回，绑定 mask<b32> full mask。
               // VMI 对应: vmi.masked_store。
 
               // Store the merged interleaved output. y_pack_hi is not needed for D=64.
-              pto.vsts %y_pack, %y_ub[%y_off], %mask32_full : !pto.vreg<64xf32>, !pto.ptr<f32, ub>, !pto.mask<b32>
+              pto.mi.vsts %y_pack, %y_ub[%y_off], %mask32_full : !pto.mi.vreg<64xf32>, !pto.ptr<f32, ub>, !pto.mi.mask<b32>
             }
           }
         }
