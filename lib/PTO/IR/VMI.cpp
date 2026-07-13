@@ -1575,13 +1575,17 @@ LogicalResult VMITruncFOp::verify() {
         "requires result element type to be narrower than source element type");
   if (auto roundingAttr = (*this)->getAttrOfType<StringAttr>("rounding")) {
     StringRef rounding = roundingAttr.getValue();
-    if (rounding != "A" && rounding != "H")
-      return emitOpError("rounding attr must be A or H");
-    if (!sourceType.getElementType().isF32() ||
-        !pto::isPTOHiFloat8Type(resultType.getElementType()))
+    if (rounding != "A" && rounding != "H" && rounding != "Z")
+      return emitOpError("rounding attr must be A, H, or Z");
+    // Allow authored rounding on f32→fp8/hif8/f16/bf16 narrow; VPTO lowering
+    // consumes it via getTruncFRoundMode.
+    if (!sourceType.getElementType().isF32())
       return emitOpError(
-          "rounding attr is currently only supported for f32 to !pto.hif8 "
-          "truncf");
+          "rounding attr is currently only supported for f32-source truncf");
+    unsigned dstBits = getVMIElementBitWidth(resultType.getElementType());
+    if (dstBits >= 32)
+      return emitOpError(
+          "rounding attr requires a narrower-than-f32 result element type");
   }
   return success();
 }

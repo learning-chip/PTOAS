@@ -57,11 +57,12 @@ export PTO_SOURCE_DIR PTO_INSTALL_DIR LLVM_BUILD_DIR
 export PTOAS_PYTHON_PACKAGE_VERSION="${PTOAS_PYTHON_PACKAGE_VERSION:-${PTOAS_VERSION}}"
 bash "${PTO_SOURCE_DIR}/docker/create_wheel.sh"
 
+# create_wheel.sh writes to build/wheel-dist/ (not MLIR_PY_PKG/dist).
 shopt -s nullglob
-wheels=("${MLIR_PY_PKG}/dist/ptoas-"*.whl)
+wheels=("${PTO_SOURCE_DIR}/build/wheel-dist/ptoas-"*.whl)
 shopt -u nullglob
-((${#wheels[@]} > 0)) || { echo "error: no ptoas-*.whl under ${MLIR_PY_PKG}/dist" >&2; exit 1; }
-pip install --force-reinstall "${wheels[0]}"
+((${#wheels[@]} > 0)) || { echo "error: no ptoas-*.whl under ${PTO_SOURCE_DIR}/build/wheel-dist" >&2; exit 1; }
+pip install --force-reinstall --no-deps "${wheels[0]}"
 
 export PATH="${PTO_SOURCE_DIR}/build/tools/ptoas:${PATH}"
 export LD_LIBRARY_PATH="${LLVM_BUILD_DIR}/lib:${PTO_INSTALL_DIR}/lib:${LD_LIBRARY_PATH:-}"

@@ -212,9 +212,13 @@ def addptr(base_ptr, index_offset):
 _VLOAD_DIST_TOKENS = {
     "NORM",
     "UNPK_B8", "UNPK_B16", "UNPK_B32",
-    "BRC_B8", "BRC_B16", "BRC_B32",
+    "BRC_B8", "BRC_B16", "BRC_B32", "BRC_BLK",
     "US_B8", "US_B16",
     "DS_B8", "DS_B16",
+    # SPEC / VPTO.cpp vector-load dist modes used by MX educational ports
+    "E2B_B16", "E2B_B32",
+    "UNPK4",
+    "SPLT4CHN",
 }
 
 
@@ -1946,36 +1950,22 @@ def vrsqrt(inp, mask):
 
 
 def vcgmax(v, mask):
-    """``pto.vcgmax`` – group maximum reduction, surfaced as the lowest-lane scalar."""
-    _reject_low_precision_vreg_operands(v, context="pto.vcgmax(...)")
-    reduced = _pto.VcgmaxOp(
-        unwrap_surface_value(v).type,
-        unwrap_surface_value(v),
-        unwrap_surface_value(mask),
-    ).result
-    return _extract_lowest_lane_scalar(reduced, mask)
+    """``pto.vcgmax`` – per-VLane group maximum; result is a full vreg.
+
+    SPEC: one max per 32-byte VLane is written to result elements 0..7;
+    remaining lanes are zero. Returns the vector result (not a scalar).
+    """
+    return _emit_unary_vec_op(_pto.VcgmaxOp, v, mask)
 
 
 def vcgadd(v, mask):
-    """``pto.vcgadd`` – group sum reduction, surfaced as the lowest-lane scalar."""
-    _reject_low_precision_vreg_operands(v, context="pto.vcgadd(...)")
-    reduced = _pto.VcgaddOp(
-        unwrap_surface_value(v).type,
-        unwrap_surface_value(v),
-        unwrap_surface_value(mask),
-    ).result
-    return _extract_lowest_lane_scalar(reduced, mask)
+    """``pto.vcgadd`` – per-VLane group sum; result is a full vreg."""
+    return _emit_unary_vec_op(_pto.VcgaddOp, v, mask)
 
 
 def vcgmin(v, mask):
-    """``pto.vcgmin`` – group minimum reduction, surfaced as the lowest-lane scalar."""
-    _reject_low_precision_vreg_operands(v, context="pto.vcgmin(...)")
-    reduced = _pto.VcgminOp(
-        unwrap_surface_value(v).type,
-        unwrap_surface_value(v),
-        unwrap_surface_value(mask),
-    ).result
-    return _extract_lowest_lane_scalar(reduced, mask)
+    """``pto.vcgmin`` – per-VLane group minimum; result is a full vreg."""
+    return _emit_unary_vec_op(_pto.VcgminOp, v, mask)
 
 
 def vcpadd(v, mask):
@@ -2022,6 +2012,54 @@ def vlrelu(inp, alpha, mask):
     return _emit_vec_scalar_masked_op(_pto.VlreluOp, inp, alpha, mask, context="vlrelu")
 
 
+def vshrs(inp, scalar, mask):
+    """``pto.vshrs`` – vector shift-right by a uniform ``i16`` amount."""
+    _reject_low_precision_vreg_operands(inp, context="pto.vshrs(...)")
+    i16 = IntegerType.get_signless(16)
+    raw = unwrap_surface_value(scalar)
+    if hasattr(raw, "type"):
+        scalar_value = coerce_scalar_to_type(raw, i16, context="vshrs")
+    else:
+        scalar_value = materialize_scalar_literal(int(raw), i16, context="vshrs")
+    return wrap_surface_value(
+        _pto.VshrsOp(
+            unwrap_surface_value(inp).type,
+            unwrap_surface_value(inp),
+            unwrap_surface_value(scalar_value),
+            unwrap_surface_value(mask),
+        ).result
+    )
+
+
+def vshls(inp, scalar, mask):
+    """``pto.vshls`` – vector shift-left by a uniform ``i16`` amount."""
+    _reject_low_precision_vreg_operands(inp, context="pto.vshls(...)")
+    i16 = IntegerType.get_signless(16)
+    raw = unwrap_surface_value(scalar)
+    if hasattr(raw, "type"):
+        scalar_value = coerce_scalar_to_type(raw, i16, context="vshls")
+    else:
+        scalar_value = materialize_scalar_literal(int(raw), i16, context="vshls")
+    return wrap_surface_value(
+        _pto.VshlsOp(
+            unwrap_surface_value(inp).type,
+            unwrap_surface_value(inp),
+            unwrap_surface_value(scalar_value),
+            unwrap_surface_value(mask),
+        ).result
+    )
+
+
+def vands(inp, scalar, mask):
+    """``pto.vands`` – vector AND scalar (emulated via ``vand`` + ``vbr``)."""
+    return vand(
+        inp,
+        vbr(_coerce_scalar_like_vector_element(inp, scalar, context="vands")),
+        mask,
+    )
+
+
+
 def vaddrelu(lhs, rhs, mask):
     """``pto.vaddrelu`` – add, then apply ReLU."""
     return vrelu(vadd(lhs, rhs, mask), mask)
@@ -2046,6 +2084,52 @@ def vaxpy(alpha, x, y, mask):
         ).result
     )
 
+
+
+def vci(dtype_or_base, base=None, *, order=None):
+    """``pto.vci`` – generate lane indices from a scalar base.
+
+    Forms:
+      ``vci(pto.i32, 0)``  – dtype + Python/runtime base (educational)
+      ``vci(base)``        – typed scalar base; result elem type matches base
+    """
+    if base is None:
+        raw_base = unwrap_surface_value(dtype_or_base)
+        if hasattr(raw_base, "type"):
+            scalar_value = raw_base
+            elem_type = raw_base.type
+        elif isinstance(raw_base, int):
+            elem_type = IntegerType.get_signless(32)
+            scalar_value = materialize_scalar_literal(raw_base, elem_type, context="vci(base)")
+        else:
+            raise TypeError("vci(base) expects a runtime scalar or Python int")
+    else:
+        elem_type = _resolve(dtype_or_base)
+        raw_base = unwrap_surface_value(base)
+        if hasattr(raw_base, "type"):
+            scalar_value = coerce_scalar_to_type(raw_base, elem_type, context="vci(dtype, base)")
+        else:
+            scalar_value = materialize_scalar_literal(raw_base, elem_type, context="vci(dtype, base)")
+
+    result_type = _resolve(vreg_type(_elements_per_vreg(elem_type), elem_type))
+    kwargs = {}
+    if order is not None:
+        kwargs["order"] = order
+    return wrap_surface_value(_pto.VciOp(result_type, scalar_value, **kwargs).result)
+
+
+def vmula(acc, lhs, rhs, mask):
+    """``pto.vmula`` – fused multiply-add ``acc + lhs * rhs``."""
+    _reject_low_precision_vreg_operands(acc, lhs, rhs, context="pto.vmula(...)")
+    return wrap_surface_value(
+        _pto.VmulaOp(
+            unwrap_surface_value(acc).type,
+            unwrap_surface_value(acc),
+            unwrap_surface_value(lhs),
+            unwrap_surface_value(rhs),
+            unwrap_surface_value(mask),
+        ).result
+    )
 
 def vsel(true_v, false_v, mask):
     """``pto.vsel`` – element-wise select under a predicate mask."""
@@ -5487,8 +5571,9 @@ __all__ = [
     "vcmax", "vcadd", "vcmin", "vdup", "vexpdif",
     "vexp", "vln", "vsqrt", "vabs", "vneg", "vrec", "vrsqrt", "vrelu", "vnot",
     "vcgmax", "vcgadd", "vcgmin", "vcpadd",
-    "vadds", "vsubs", "vmuls", "vmaxs", "vmins", "vlrelu",
+    "vadds", "vsubs", "vmuls", "vmaxs", "vmins", "vlrelu", "vshrs", "vshls", "vands",
     "vaxpy", "vaddrelu", "vsubrelu",
+    "vci", "vmula",
     "vsel",
     "make_tensor_view", "partition_view",
     "alloc_tile",
