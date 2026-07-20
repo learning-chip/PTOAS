@@ -37,9 +37,12 @@ PTOAS_VERSION="${PTOAS_VERSION:-$(python "${PTO_SOURCE_DIR}/.github/scripts/comp
 
 cd "$PTO_SOURCE_DIR"
 
+# Release (-O3) is required with LinuxHardeningCache: _FORTIFY_SOURCE=2
+# errors under -Werror when optimization is off (default cmake build type).
 cmake -C "${PTO_SOURCE_DIR}/cmake/LinuxHardeningCache.cmake" -G Ninja \
   -S . \
   -B build \
+  -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_DIR="${LLVM_BUILD_DIR}/lib/cmake/llvm" \
   -DMLIR_DIR="${LLVM_BUILD_DIR}/lib/cmake/mlir" \
   -DPython3_ROOT_DIR="${PY_ROOT}" \
@@ -58,9 +61,12 @@ export PTOAS_PYTHON_PACKAGE_VERSION="${PTOAS_PYTHON_PACKAGE_VERSION:-${PTOAS_VER
 bash "${PTO_SOURCE_DIR}/docker/create_wheel.sh"
 
 shopt -s nullglob
-wheels=("${MLIR_PY_PKG}/dist/ptoas-"*.whl)
+wheels=("${PTO_SOURCE_DIR}/build/wheel-dist/ptoas-"*.whl)
+if ((${#wheels[@]} == 0)); then
+  wheels=("${MLIR_PY_PKG}/dist/ptoas-"*.whl)
+fi
 shopt -u nullglob
-((${#wheels[@]} > 0)) || { echo "error: no ptoas-*.whl under ${MLIR_PY_PKG}/dist" >&2; exit 1; }
+((${#wheels[@]} > 0)) || { echo "error: no ptoas-*.whl under build/wheel-dist or ${MLIR_PY_PKG}/dist" >&2; exit 1; }
 pip install --force-reinstall "${wheels[0]}"
 
 export PATH="${PTO_SOURCE_DIR}/build/tools/ptoas:${PATH}"

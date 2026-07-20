@@ -450,14 +450,16 @@ static bool compileDeviceLLVMToObject(llvm::StringRef llPath,
     args.push_back("-mllvm");
     args.push_back("--cce-aicore-vec-misched=0");
   }
+  // Pass the .ll path as a file. Piping IR on stdin (`-x ir -`) makes this
+  // CANN bisheng segfault in SelectionDAG; file input works.
   args.push_back("-c");
   args.push_back("-x");
   args.push_back("ir");
-  args.push_back("-");
+  args.push_back(llPath.str());
   args.push_back("-o");
   args.push_back(outObjPath.str());
   return runCommandWithStderr(bishengPath, args, stderrPath, diagOS,
-                              "device LLVM compilation", llPath);
+                              "device LLVM compilation");
 }
 
 static bool compileCppDeviceSourceToObject(
